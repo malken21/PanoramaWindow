@@ -20,6 +20,14 @@ public class Config {
     private int Width = 1280;
     private int Height = 720;
     private boolean Borderless = false;
+    // Minimum client ticks between two capture batches. The window still redraws every frame; this
+    // only limits how often the world is re-rendered to refresh the (world-locked) cube faces.
+    private int CaptureInterval = 2;
+    // How many of the six cube faces are re-rendered per capture batch (1..6). Lower spreads the
+    // cost over more ticks (smoother frame pacing, slower full refresh); 6 restores the old burst.
+    private int FacesPerCapture = 2;
+    // Skip capturing (and just hold the last frame) while the panorama window is minimized.
+    private boolean PauseWhenHidden = true;
 
     public int getCameraSize() {
         return CameraSize;
@@ -27,6 +35,33 @@ public class Config {
 
     public void setCameraSize(int cameraSize) {
         CameraSize = cameraSize;
+        serialize();
+    }
+
+    public int getCaptureInterval() {
+        return Math.max(1, CaptureInterval);
+    }
+
+    public void setCaptureInterval(int captureInterval) {
+        CaptureInterval = Math.max(1, captureInterval);
+        serialize();
+    }
+
+    public int getFacesPerCapture() {
+        return Math.min(6, Math.max(1, FacesPerCapture));
+    }
+
+    public void setFacesPerCapture(int facesPerCapture) {
+        FacesPerCapture = Math.min(6, Math.max(1, facesPerCapture));
+        serialize();
+    }
+
+    public boolean isPauseWhenHidden() {
+        return PauseWhenHidden;
+    }
+
+    public void setPauseWhenHidden(boolean pauseWhenHidden) {
+        PauseWhenHidden = pauseWhenHidden;
         serialize();
     }
 
@@ -61,7 +96,10 @@ public class Config {
             int CameraSize,
             int Width,
             int Height,
-            boolean Borderless
+            boolean Borderless,
+            int CaptureInterval,
+            int FacesPerCapture,
+            boolean PauseWhenHidden
     ) {
     }
 
@@ -89,6 +127,13 @@ public class Config {
         Width = model.Width();
         Height = model.Height();
         Borderless = model.Borderless();
+        // Keep the defaults when an older config file predates these fields.
+        if (model.CaptureInterval() > 0) {
+            CaptureInterval = model.CaptureInterval();
+        }
+        if (model.FacesPerCapture() > 0) {
+            FacesPerCapture = model.FacesPerCapture();
+        }
     }
 
     private void serialize() {
@@ -96,7 +141,10 @@ public class Config {
                 getCameraSize(),
                 getWidth(),
                 getHeight(),
-                isBorderless()
+                isBorderless(),
+                getCaptureInterval(),
+                getFacesPerCapture(),
+                isPauseWhenHidden()
         ));
     }
 

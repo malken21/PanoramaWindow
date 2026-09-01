@@ -72,35 +72,33 @@ public class PanoramaClientGameTest implements FabricClientGameTest {
             mcShot(context, "mc-04-overworld-after-walk");
 
             // ---- Travel to the Nether ----
-            server.runCommand("execute in minecraft:the_nether run fill -10 62 -10 10 62 10 minecraft:obsidian");
-            server.runCommand("execute in minecraft:the_nether run fill -9 63 -9 9 90 9 minecraft:air");
-            server.runCommand("execute as @a in minecraft:the_nether run tp @s 0.5 64.0 0.5");
-            context.waitTicks(10); // let the dimension swap happen; the mod deliberately pauses here
-            singleplayer.getConnection().waitForChunksRender();
+            enterDimension(context, singleplayer, server, "minecraft:the_nether", "minecraft:obsidian");
             faceNorth(context);
             context.waitTicks(50); // past the mod's post-dimension-change settle
             captures = assertKeptCapturing(captures, "after entering the Nether");
+            assertPlayerNear(context, 0.5, 64.0, 0.5, "in the Nether");
             savePanorama(context, "05-nether.png");
             mcShot(context, "mc-05-nether");
 
             // ---- Travel to the End ----
-            server.runCommand("execute in minecraft:the_end run fill -10 62 -10 10 62 10 minecraft:end_stone");
-            server.runCommand("execute as @a in minecraft:the_end run tp @s 0.5 64.0 0.5");
-            context.waitTicks(10);
-            singleplayer.getConnection().waitForChunksRender();
+            enterDimension(context, singleplayer, server, "minecraft:the_end", "minecraft:end_stone");
             faceNorth(context);
             context.waitTicks(50);
             captures = assertKeptCapturing(captures, "after entering the End");
+            assertPlayerNear(context, 0.5, 64.0, 0.5, "in the End");
             savePanorama(context, "06-end.png");
             mcShot(context, "mc-06-end");
 
-            // ---- Back to the Overworld ----
+            // ---- Back to the Overworld (the landmark ring + its smooth-stone floor are still there) ----
             server.runCommand("execute as @a in minecraft:overworld run tp @s 0.5 100.5 0.5");
             context.waitTicks(10);
             singleplayer.getConnection().waitForChunksRender();
+            server.runCommand("execute as @a in minecraft:overworld run tp @s 0.5 100.5 0.5");
+            context.waitTicks(20);
             faceNorth(context);
             context.waitTicks(50);
             assertKeptCapturing(captures, "back in the Overworld");
+            assertPlayerNear(context, 0.5, 100.5, 0.5, "back in the Overworld");
             savePanorama(context, "07-overworld-return.png");
 
             // ---- checks ----
@@ -142,6 +140,41 @@ public class PanoramaClientGameTest implements FabricClientGameTest {
             client.player.setXRot(0.0F);
             client.player.setYRot(180.0F); // yaw 180 = facing -Z = north
         });
+    }
+
+    /**
+     * Gets the player into {@code dimension}, builds a thick platform around the origin (only once the
+     * area has actually generated), and drops the player onto it - the Nether has no guaranteed floor
+     * at (0, 64, 0), so a naive fill + teleport lets the player clip straight through.
+     */
+    private void enterDimension(ClientGameTestContext context, TestSingleplayerContext singleplayer,
+                                TestServerContext server, String dimension, String platformBlock) {
+        server.runCommand("execute as @a in " + dimension + " run tp @s 0.5 120.0 0.5");
+        context.waitTicks(10); // dimension swap; the mod deliberately pauses here
+        singleplayer.getConnection().waitForChunksRender();
+
+        server.runCommand("execute in " + dimension + " run forceload add -16 -16 16 16");
+        server.runCommand("execute in " + dimension + " run fill -14 48 -14 14 63 14 " + platformBlock);
+        server.runCommand("execute in " + dimension + " run fill -13 64 -13 13 98 13 minecraft:air");
+
+        for (int attempt = 0; attempt < 8; attempt++) {
+            server.runCommand("execute as @a in " + dimension + " run tp @s 0.5 66.0 0.5");
+            context.waitTicks(12);
+            double y = context.computeOnClient(client -> client.player.getY());
+            if (Math.abs(y - 64.0) < 1.5) break;
+        }
+        server.runCommand("execute in " + dimension + " run forceload remove -16 -16 16 16");
+        singleplayer.getConnection().waitForChunksRender();
+    }
+
+    private void assertPlayerNear(ClientGameTestContext context, double x, double y, double z, String where) {
+        double[] pos = context.computeOnClient(client -> new double[]{
+                client.player.getX(), client.player.getY(), client.player.getZ()});
+        double dx = pos[0] - x, dy = pos[1] - y, dz = pos[2] - z;
+        if (dx * dx + dy * dy + dz * dz > 9.0) {
+            throw new AssertionError("Player drifted from the expected spot " + where + ": expected near ("
+                    + x + ", " + y + ", " + z + ") but was (" + pos[0] + ", " + pos[1] + ", " + pos[2] + ")");
+        }
     }
 
     private long assertKeptCapturing(long previous, String what) {

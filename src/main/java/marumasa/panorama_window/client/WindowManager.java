@@ -32,6 +32,12 @@ public class WindowManager {
     private WindowPos windowPos;
     private CursorPos cursorPos;
     private boolean isDragging = false;
+    // Avoids re-clearing + swapping the window every tick while it is already black.
+    private boolean isBlack = false;
+
+    // The last yaw the window was drawn with; lets renderShader skip a full context switch + redraw
+    // when nothing has changed (view held still, no new face data, no screenshot pending).
+    private float lastYaw = Float.NaN;
 
     // Set by requestCapture(...); the next shader render writes the panorama window to this file.
     private volatile Path pendingCapture;
@@ -99,6 +105,7 @@ public class WindowManager {
         glfwSwapInterval(0);
         // Paint it black to start with.
         runBlack();
+        isBlack = true;
 
         // Drag the window around with the left mouse button.
         glfwSetMouseButtonCallback(window, (window, button, action, mods) -> {
@@ -160,11 +167,25 @@ public class WindowManager {
                     GL_UNSIGNED_BYTE,
                     (ByteBuffer) null
             );
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            // GL_CLAMP was removed in GL 3.1; CLAMP_TO_EDGE keeps face edges from wrapping.
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         }
+
+        // The sampler -> texture-unit mapping never changes, so bind it once instead of
+        // re-querying the uniform locations on every frame.
+        int program = shaderManager.getShaderProgram();
+        glUseProgram(program);
+        for (int i = 0; i < SAMPLER_NAMES.length; i++) {
+            int location = glGetUniformLocation(program, SAMPLER_NAMES[i]);
+            if (location >= 0) {
+                glUniform1i(location, i);
+            }
+        }
+        uYawLocation = glGetUniformLocation(program, "uYaw");
+        glUseProgram(0);
 
         // Hand the context back to Minecraft.
         releaseContext();
@@ -175,9 +196,10 @@ public class WindowManager {
     private final int VBO;
     private final int VAO;
     private final ShaderManager shaderManager;
+    private final int uYawLocation;
 
     // Sampler uniform -> texture unit. Index matches the cube face order produced by PanoramaManager:
-    // 0=front, 1=right, 2=back, 3=left, 4=top, 5=bottom.
+    // 0=front(N), 1=right(E), 2=back(S), 3=left(W), 4=top, 5=bottom.
     private static final String[] SAMPLER_NAMES = {
             "texFront", "texRight", "texBack", "texLeft", "texTop", "texBottom"
     };
@@ -197,19 +219,34 @@ public class WindowManager {
         this.pendingCapture = path;
     }
 
-    public void renderShader(ByteBuffer[] buffers) {
+    /**
+     * Redraws the panorama window.
+     *
+     * @param buffers   the six CPU face buffers
+     * @param yawRadians horizontal view rotation (0 = "front"/north face centred)
+     * @param dirtyMask  bit {@code i} set => face {@code i} has new pixels to upload
+     */
+    public void renderShader(ByteBuffer[] buffers, float yawRadians, int dirtyMask) {
+        boolean changed = dirtyMask != 0
+                || pendingCapture != null
+                || isBlack
+                || Float.isNaN(lastYaw)
+                || Math.abs(yawRadians - lastYaw) > 1.0e-4f
+                || isDragging;
+        if (!changed) return;
+
         makeContext();
         try {
             glViewport(0, 0, window_width, window_height);
 
-            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            glClear(GL_COLOR_BUFFER_BIT);
 
-            int program = shaderManager.getShaderProgram();
-            glUseProgram(program);
+            glUseProgram(shaderManager.getShaderProgram());
+            if (uYawLocation >= 0) {
+                glUniform1f(uYawLocation, yawRadians);
+            }
 
-            uploadFaces(buffers, camera_size, camera_size);
-            bindSamplers(program);
+            uploadFaces(buffers, dirtyMask);
 
             glBindVertexArray(VAO);
             glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
@@ -221,9 +258,16 @@ public class WindowManager {
             }
 
             glfwSwapBuffers(window);
+            isBlack = false;
+            lastYaw = yawRadians;
         } finally {
             releaseContext();
         }
+    }
+
+    /** True while the panorama window is minimized (nothing on screen to update). */
+    public boolean isMinimized() {
+        return glfwGetWindowAttrib(window, GLFW_ICONIFIED) == GLFW_TRUE;
     }
 
     private void writeWindowPng(Path path) {
@@ -252,10 +296,13 @@ public class WindowManager {
     }
 
     public void renderBlack() {
+        if (isBlack) return;
         makeContext();
         try {
             glViewport(0, 0, window_width, window_height);
             runBlack();
+            isBlack = true;
+            lastYaw = Float.NaN;
         } finally {
             releaseContext();
         }
@@ -267,21 +314,14 @@ public class WindowManager {
         glfwSwapBuffers(window);
     }
 
-    private void bindSamplers(int program) {
-        for (int i = 0; i < SAMPLER_NAMES.length; i++) {
-            int location = glGetUniformLocation(program, SAMPLER_NAMES[i]);
-            if (location >= 0) {
-                glUniform1i(location, i);
-            }
-        }
-    }
-
-    private void uploadFaces(ByteBuffer[] buffers, int width, int height) {
+    private void uploadFaces(ByteBuffer[] buffers, int dirtyMask) {
         for (int i = 0; i < 6; i++) {
+            if ((dirtyMask & (1 << i)) == 0) continue;
             glActiveTexture(GL_TEXTURE0 + i);
             glBindTexture(GL_TEXTURE_2D, textures[i]);
-            // upload the face data
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, buffers[i]);
+            // Stream the new pixels into the already-allocated texture instead of
+            // reallocating its storage every frame with glTexImage2D.
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, camera_size, camera_size, GL_RGBA, GL_UNSIGNED_BYTE, buffers[i]);
         }
     }
 }

@@ -3,6 +3,10 @@
 
 in vec2 TexCoord;
 
+// The six faces are captured world-axis-aligned (front = north view / shader +Z, right = east / +X,
+// back = south / -Z, left = west / -X, top = +Y, bottom = -Y). They no longer follow the player, so
+// turning the view is just a longitude offset (uYaw) applied here per frame instead of re-rendering
+// the world.
 uniform sampler2D texFront;
 uniform sampler2D texRight;
 uniform sampler2D texBack;
@@ -10,60 +14,55 @@ uniform sampler2D texLeft;
 uniform sampler2D texBottom;
 uniform sampler2D texTop;
 
+// Horizontal view rotation in radians. 0 puts the "front" (north) face at the window centre.
+uniform float uYaw;
+
 out vec4 FragColor;
 
-vec2 Remap (vec2 value, vec2 inMin, vec2 inMax, vec2 outMin, vec2 outMax){
-    // 入力値を0から1の範囲に正規化
-    vec2 base = clamp((value - inMin) / (inMax - inMin), 0.0, 1.0);
-    // 目的の範囲に線形補間
-    return outMin + (outMax - outMin) * base;
-}
-
-vec2 Mapping (vec2 Angle, vec2 inMin, vec2 inMax){
-    return Remap(Angle, inMin, inMax, vec2(0.0, 0.0), vec2(1.0, 1.0));
-}
-vec3 genSphereVector(){
-    vec2 source = -vec2(PI) + (TexCoord - vec2(0, 0)) * (vec2(PI) - -vec2(PI)) / (vec2(1, 1) - vec2(0, 0));
-    float srcY = source.y / 2.0;
-    float cosY = cos(srcY);
-    return vec3(cosY * sin(source.x), sin(srcY), cosY * cos(source.x));
-}
-float genMask(vec3 SphereVector, vec3 DirectionVector, vec2 Map){
-    float Mask_Direction = clamp(ceil(dot(SphereVector, DirectionVector)), 0.0, 1.0);
-    vec2 Mask_Floor = 1.0 - floor(Map);
-    vec2 Mask_Ceil = ceil(Map);
-    return Mask_Floor.x *Mask_Floor.y *Mask_Ceil.x *Mask_Ceil.y * Mask_Direction;
-}
-
-vec3 genAngle(vec3 SphereVector){
-    float dotYZ = dot(normalize(vec3(0.0, SphereVector.y, SphereVector.z)), SphereVector);
-    float dotXY = dot(normalize(vec3(SphereVector.x, SphereVector.y, 0.0)), SphereVector);
-    float dotXZ = dot(normalize(vec3(SphereVector.x, 0.0, SphereVector.z)), SphereVector);
-    vec3 append = vec3(dotYZ, dotXZ, dotXY);
-    return sqrt(1.0 - (append * append));
+// Equirectangular pixel -> unit direction in the world-aligned cube frame.
+vec3 genSphereVector() {
+    vec2 source = -vec2(PI) + TexCoord * (2.0 * PI);
+    // Turn the view by rotating the sampled longitude rather than moving the cameras.
+    source.x += uYaw;
+    float lat = source.y * 0.5;               // -PI/2 .. PI/2
+    float cosLat = cos(lat);
+    return vec3(cosLat * sin(source.x), sin(lat), cosLat * cos(source.x));
 }
 
 void main() {
-    vec3 SphereVector = genSphereVector();
-    vec3 Angle = genAngle(SphereVector);
+    vec3 d = genSphereVector();
+    vec3 ad = abs(d);
+    vec2 uv;
+    vec4 color;
 
-    vec2 Angle_X = vec2((1.0 / Angle.x) * SphereVector.yz);
-    vec2 Angle_Y = vec2((1.0 / Angle.y) * SphereVector.xz);
-    vec2 Angle_Z = vec2((1.0 / Angle.z) * SphereVector.xy);
+    // Pick the single dominant axis (like a hardware cubemap) and gnomonic-project onto that face.
+    // The per-face uv expressions match the previous multi-sample shader exactly, so orientation is
+    // unchanged - but each pixel now comes from one face only, so there are no blend seams.
+    if (ad.x >= ad.y && ad.x >= ad.z) {
+        if (d.x > 0.0) {                                                   // +X  east / right
+            uv = vec2((1.0 - d.z / ad.x) * 0.5, (d.y / ad.x + 1.0) * 0.5);
+            color = texture(texRight, uv);
+        } else {                                                          // -X  west / left
+            uv = vec2((d.z / ad.x + 1.0) * 0.5, (d.y / ad.x + 1.0) * 0.5);
+            color = texture(texLeft, uv);
+        }
+    } else if (ad.y >= ad.z) {
+        if (d.y > 0.0) {                                                   // +Y  up / top
+            uv = vec2((d.x / ad.y + 1.0) * 0.5, (1.0 - d.z / ad.y) * 0.5);
+            color = texture(texTop, uv);
+        } else {                                                          // -Y  down / bottom
+            uv = vec2((d.x / ad.y + 1.0) * 0.5, (d.z / ad.y + 1.0) * 0.5);
+            color = texture(texBottom, uv);
+        }
+    } else {
+        if (d.z > 0.0) {                                                   // +Z  north / front
+            uv = vec2((d.x / ad.z + 1.0) * 0.5, (d.y / ad.z + 1.0) * 0.5);
+            color = texture(texFront, uv);
+        } else {                                                          // -Z  south / back
+            uv = vec2((1.0 - d.x / ad.z) * 0.5, (d.y / ad.z + 1.0) * 0.5);
+            color = texture(texBack, uv);
+        }
+    }
 
-    vec2 Map_Left = Mapping(Angle_X, vec2(-1.0, -1.0), vec2(1.0, 1.0));
-    vec2 Map_Right = Mapping(Angle_X, vec2(-1.0, 1.0), vec2(1.0, -1.0));
-    vec2 Map_Bottom = Mapping(Angle_Y, vec2(-1.0, -1.0), vec2(1.0, 1.0));
-    vec2 Map_Top = Mapping(Angle_Y, vec2(-1.0, 1.0), vec2(1.0, -1.0));
-    vec2 Map_Back = Mapping(Angle_Z, vec2(1.0, -1.0), vec2(-1.0, 1.0));
-    vec2 Map_Front = Mapping(Angle_Z, vec2(-1.0, -1.0), vec2(1.0, 1.0));
-
-    vec4 Color_Left = texture(texLeft, vec2(Map_Left.y, Map_Left.x)) *genMask(SphereVector, vec3(-1.0, 0.0, 0.0), Map_Left);
-    vec4 Color_Right = texture(texRight, vec2(Map_Right.y, Map_Right.x)) *genMask(SphereVector, vec3(1.0, 0.0, 0.0), Map_Right);
-    vec4 Color_Bottom = texture(texBottom, Map_Bottom) *genMask(SphereVector, vec3(0.0, -1.0, 0.0), Map_Bottom);
-    vec4 Color_Top = texture(texTop, Map_Top) *genMask(SphereVector, vec3(0.0, 1.0, 0.0), Map_Top);
-    vec4 Color_Back = texture(texBack, Map_Back) *genMask(SphereVector, vec3(0.0, 0.0, -1.0), Map_Back);
-    vec4 Color_Front = texture(texFront, Map_Front) *genMask(SphereVector, vec3(0.0, 0.0, 1.0), Map_Front);
-
-    FragColor=Color_Left+Color_Right+Color_Back+Color_Front+Color_Bottom+Color_Top;
+    FragColor = vec4(color.rgb, 1.0);
 }
