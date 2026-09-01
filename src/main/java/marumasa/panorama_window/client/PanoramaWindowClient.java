@@ -105,7 +105,7 @@ public class PanoramaWindowClient implements ClientModInitializer {
         float perTickPitch = pitch - client.player.xRotO;
         float pitchDegrees = Math.abs(perTickPitch) < 30.0F ? pitch - perTickPitch * (1.0F - partialTick) : pitch;
         float pitchRadians = (float) Math.toRadians(pitchDegrees);
-        windows.renderShader(panorama.getBuffers(), panorama.faceSize(),
+        windows.renderShader(panorama.faceGlIds(), panorama.faceSize(),
                 yawRadians, pitchRadians, panorama.drainDirtyFaces());
     }
 }

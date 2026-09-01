@@ -1,7 +1,6 @@
 package marumasa.panorama_window.client;
 
-import com.mojang.blaze3d.buffers.GpuBuffer;
-import com.mojang.blaze3d.buffers.GpuBufferSlice;
+import com.mojang.blaze3d.opengl.GlTexture;
 import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.blaze3d.platform.Window;
 import com.mojang.blaze3d.systems.GpuDevice;
@@ -11,16 +10,14 @@ import net.minecraft.client.Camera;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
-import org.lwjgl.BufferUtils;
-
-import java.nio.ByteBuffer;
-import java.util.stream.IntStream;
+import net.minecraft.util.Mth;
+import org.lwjgl.opengl.GL11C;
 
 import static marumasa.panorama_window.PanoramaWindow.LOGGER;
 
 /**
- * Captures the world around the player as six <em>world-axis-aligned</em> cube faces and copies
- * each face back into a CPU {@link ByteBuffer} for the mod's separate OpenGL window.
+ * Captures the world around the player as six <em>world-axis-aligned</em> cube faces so the mod's
+ * separate OpenGL window can show a live 360&deg; panorama.
  *
  * <p>Because the faces are locked to the world (north / east / south / west / up / down) rather
  * than to the player, turning the view no longer needs a re-render - the window shader just
@@ -29,17 +26,18 @@ import static marumasa.panorama_window.PanoramaWindow.LOGGER;
  * several client ticks ({@code FacesPerCapture} at a time) so there is no periodic six-render
  * stall.
  *
- * <p>Since Minecraft 26.1 texture read-back goes through the Blaze3D GPU abstraction, so the
- * pixels for a face arrive one frame later via a fenced task; {@link #drainDirtyFaces()} reports
- * which faces have new data waiting to be uploaded.
+ * <p>Each rendered face is copied <em>GPU-to-GPU</em> ({@link
+ * com.mojang.blaze3d.systems.CommandEncoder#copyTextureToTexture}) straight into a persistent
+ * texture that the panorama window samples directly. The panorama window shares Minecraft's GL
+ * context, so there is no CPU read-back and no re-upload.
  */
 public class PanoramaManager {
 
     private static volatile boolean taking = false;
 
-    /** Number of individual faces that have finished reading back. */
+    /** Number of individual faces that have finished capturing. */
     public static volatile long completedFaceReadbacks = 0;
-    /** Number of full six-face sweeps that have finished reading back. Used by the client game test. */
+    /** Number of full six-face sweeps that have finished. Used by the client game test. */
     public static volatile long completedCaptures = 0;
 
     /**
@@ -56,18 +54,19 @@ public class PanoramaManager {
     }
 
     // Cube-face capture resolution. Follows the panorama window's size: re-read from
-    // windows.faceSize() at each sweep boundary and the buffers reallocated to match.
+    // windows.faceSize() at each sweep boundary and the face textures reallocated to match.
     private int cameraSize;
     private final int captureInterval;
     private final int facesPerCapture;
     private final Minecraft client;
     private final WindowManager windows;
-    private final ByteBuffer[] buffers;
 
-    private GpuBuffer[] readbackBuffers;
-    private volatile int inFlight = 0;
+    // Six persistent GPU textures, one per cube face, sampled directly by the panorama window
+    // (shared GL context). A rendered face is blitted into these with copyTextureToTexture.
+    private GpuTexture[] faceTextures;
+    private final int[] faceGlIds = new int[6];
 
-    // Faces whose CPU buffer holds pixels not yet uploaded to the window textures.
+    // Faces whose texture holds pixels not yet presented by the window.
     private final Object dirtyLock = new Object();
     private int dirtyMask = 0;
 
@@ -76,6 +75,13 @@ public class PanoramaManager {
 
     // Throttles how often a capture batch is started. Counts eligible ticks since the last batch.
     private int ticksSinceCapture = 0;
+
+    // Idle skip: a world-locked sweep only needs redoing when the scene can change. Standing still
+    // in a quiet spot, re-rendering the world six times every CaptureInterval ticks is pure waste.
+    private static final int IDLE_RESWEEP_TICKS = 40; // still re-sweep ~every 2s for time / mobs / blocks
+    private double lastSweepX = Double.NaN, lastSweepY = Double.NaN, lastSweepZ = Double.NaN;
+    private float lastSweepYaw = Float.NaN;
+    private int idleTicks = 0;
 
     // The client level/player instances are swapped out on a dimension change (and the level
     // renderer reloads); wait a few ticks before re-rendering the world again.
@@ -88,29 +94,26 @@ public class PanoramaManager {
         this.cameraSize = windows.faceSize();
         this.captureInterval = Math.max(1, captureInterval);
         this.facesPerCapture = Math.min(6, Math.max(1, facesPerCapture));
-        // Six CPU-side RGBA buffers, one per cube face.
-        this.buffers = IntStream.range(0, 6)
-                .mapToObj(i -> BufferUtils.createByteBuffer(this.cameraSize * this.cameraSize * 4))
-                .toArray(ByteBuffer[]::new);
     }
 
-    public ByteBuffer[] getBuffers() {
-        return buffers;
+    /** GL texture names of the six face textures (shared context), for the window to bind. */
+    public int[] faceGlIds() {
+        return faceGlIds;
     }
 
-    /** Edge length (px) of the current face buffers - hand this to the window with the buffers. */
+    /** Edge length (px) of the current face textures - hand this to the window with the ids. */
     public int faceSize() {
         return cameraSize;
     }
 
-    /** True once every face has been read back at least once (the window would otherwise show gaps). */
+    /** True once every face has been captured at least once (the window would otherwise show gaps). */
     public boolean hasFirstSweep() {
         return completedFaceReadbacks >= 6;
     }
 
     /**
      * Returns the bit mask of faces that have new pixels since the last call and clears it, so the
-     * window only re-uploads textures that actually changed.
+     * window only re-presents when something actually changed.
      */
     public int drainDirtyFaces() {
         synchronized (dirtyLock) {
@@ -135,8 +138,6 @@ public class PanoramaManager {
 
     public void take() {
         if (!RenderSystem.isOnRenderThread()) return;
-        // A previous batch is still being read back - don't stomp on those buffers.
-        if (inFlight > 0) return;
 
         final LocalPlayer player = client.player;
         if (player == null || client.level == null || client.gameRenderer == null) return;
@@ -161,16 +162,36 @@ public class PanoramaManager {
 
         // At the start of a fresh sweep:
         if (nextFace == 0) {
+            // The faces are world-locked, so a sweep only needs redoing when the scene can change.
+            // If the player has not moved or turned, re-sweep only every IDLE_RESWEEP_TICKS ticks
+            // (to pick up time of day, mobs, block changes) instead of every batch.
+            double px = player.getX(), py = player.getY(), pz = player.getZ();
+            float pyaw = player.getYRot();
+            boolean sceneMayHaveChanged = Double.isNaN(lastSweepX)
+                    || Math.abs(px - lastSweepX) > 1.0e-3
+                    || Math.abs(py - lastSweepY) > 1.0e-3
+                    || Math.abs(pz - lastSweepZ) > 1.0e-3
+                    || Math.abs(Mth.wrapDegrees(pyaw - lastSweepYaw)) > 0.05F;
+            if (!sceneMayHaveChanged && idleTicks < IDLE_RESWEEP_TICKS) {
+                idleTicks += captureInterval;
+                return;
+            }
+            idleTicks = 0;
+            lastSweepX = px;
+            lastSweepY = py;
+            lastSweepZ = pz;
+            lastSweepYaw = pyaw;
+
             // Latch the view yaw so every face of this sweep billboards (name tags etc.)
             // consistently towards it - see billboardYawDegrees / the mixin classes.
-            billboardYawDegrees = player.getYRot();
+            billboardYawDegrees = pyaw;
 
             // Pick up any window resize: re-render the whole sphere at the resolution the new
-            // window size wants. inFlight == 0 here, so no readback is mid-copy.
+            // window size wants.
             int wanted = windows.faceSize();
             if (wanted != cameraSize) {
                 cameraSize = wanted;
-                reallocateBuffers();
+                reallocateFaceTextures();
             }
         }
 
@@ -190,8 +211,7 @@ public class PanoramaManager {
         taking = true;
         try {
             client.gameRenderer.setRenderBlockOutline(false);
-            ensureReadbackBuffers(device);
-            inFlight = count;
+            ensureFaceTextures(device, target);
 
             camera.enablePanoramicMode();
             window.setWidth(cameraSize);
@@ -208,11 +228,10 @@ public class PanoramaManager {
                 client.gameRenderer.extract(DeltaTracker.ONE, true);
                 client.gameRenderer.renderLevel(DeltaTracker.ONE);
 
-                queueReadback(device, target, face);
+                copyFace(device, target, face);
             }
         } catch (Exception exception) {
             LOGGER.error("Couldn't take panorama images", exception);
-            inFlight = 0;
         } finally {
             player.setYRot(yaw);
             player.setXRot(pitch);
@@ -226,75 +245,60 @@ public class PanoramaManager {
             taking = false;
         }
 
+        // Make the GPU-to-GPU copies visible to the panorama window's (shared) context before it
+        // next binds these textures. glFlush, not glFinish - it does not stall waiting for the GPU.
+        GL11C.glFlush();
+
         nextFace = (nextFace + count) % 6;
     }
 
     /**
-     * Resizes the CPU face buffers (and drops the GPU readback buffers so they are rebuilt at the
-     * new size) after the window changed size. Called only at a sweep boundary with no readback in
-     * flight. Pending dirty bits are cleared: those pixels are the old size and would not fit the
-     * resized textures - the faces keep their current texture until this sweep re-captures them.
+     * (Re)creates the six face textures at the current {@link #cameraSize}, closing any previous
+     * set. Called at a sweep boundary after the window changed size. Pending dirty bits are cleared:
+     * those pixels are the old size - the faces keep their current texture until this sweep
+     * re-captures them.
      */
-    private void reallocateBuffers() {
-        for (int i = 0; i < 6; i++) {
-            buffers[i] = BufferUtils.createByteBuffer(cameraSize * cameraSize * 4);
-        }
-        if (readbackBuffers != null) {
-            for (GpuBuffer buffer : readbackBuffers) {
-                if (buffer != null) buffer.close();
-            }
-            readbackBuffers = null;
-        }
+    private void reallocateFaceTextures() {
+        closeFaceTextures();
         synchronized (dirtyLock) {
             dirtyMask = 0;
         }
     }
 
-    private void ensureReadbackBuffers(GpuDevice device) {
-        if (readbackBuffers != null) return;
-        long size = (long) cameraSize * cameraSize * 4L;
-        readbackBuffers = new GpuBuffer[6];
+    private void ensureFaceTextures(GpuDevice device, RenderTarget target) {
+        if (faceTextures != null) return;
+        // Match the render target's colour format so copyTextureToTexture accepts the blit.
+        var format = target.getColorTexture().getFormat();
+        faceTextures = new GpuTexture[6];
         for (int i = 0; i < 6; i++) {
-            readbackBuffers[i] = device.createBuffer(
-                    () -> "panorama_window readback",
-                    GpuBuffer.USAGE_MAP_READ | GpuBuffer.USAGE_COPY_DST,
-                    size
+            GpuTexture tex = device.createTexture(
+                    () -> "panorama_window face",
+                    GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING,
+                    format, cameraSize, cameraSize, 1, 1
             );
+            faceTextures[i] = tex;
+            faceGlIds[i] = ((GlTexture) tex).glId();
         }
     }
 
-    private void queueReadback(GpuDevice device, RenderTarget target, int face) {
-        GpuTexture color = target.getColorTexture();
-        if (color == null) {
-            inFlight = Math.max(0, inFlight - 1);
-            return;
+    private void closeFaceTextures() {
+        if (faceTextures == null) return;
+        for (GpuTexture tex : faceTextures) {
+            if (tex != null) tex.close();
         }
+        faceTextures = null;
+    }
 
-        final GpuBuffer readback = readbackBuffers[face];
-        final int index = face;
-
-        device.createCommandEncoder().copyTextureToBuffer(color, readback, 0L, () -> {
-            try (GpuBufferSlice.MappedView view = readback.map(true, false)) {
-                ByteBuffer src = view.data();
-                ByteBuffer dst = buffers[index];
-                dst.clear();
-                int count = Math.min(src.remaining(), dst.remaining());
-                int srcLimit = src.limit();
-                src.limit(src.position() + count);
-                dst.put(src);
-                src.limit(srcLimit);
-                dst.flip();
-                synchronized (dirtyLock) {
-                    dirtyMask |= (1 << index);
-                }
-            } catch (Exception e) {
-                LOGGER.error("Couldn't read back panorama face {}", index, e);
-            } finally {
-                inFlight = Math.max(0, inFlight - 1);
-                if ((++completedFaceReadbacks % 6) == 0) {
-                    completedCaptures++;
-                }
-            }
-        }, 0);
+    private void copyFace(GpuDevice device, RenderTarget target, int face) {
+        GpuTexture color = target.getColorTexture();
+        if (color == null) return;
+        device.createCommandEncoder().copyTextureToTexture(
+                color, faceTextures[face], 0, 0, 0, 0, 0, cameraSize, cameraSize);
+        synchronized (dirtyLock) {
+            dirtyMask |= (1 << face);
+        }
+        if ((++completedFaceReadbacks % 6) == 0) {
+            completedCaptures++;
+        }
     }
 }

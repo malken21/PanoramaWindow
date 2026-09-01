@@ -33,7 +33,8 @@ public class WindowManager {
     // PanoramaManager polls faceSize() and reallocates its buffers to match at a sweep boundary,
     // then the resized pixels flow in and uploadFaces() grows/shrinks each GL texture to fit.
     private volatile int faceSize;
-    private final int[] texSize = new int[6];
+    // Last GL texture id seen in each of the six slots; when it changes we (re)apply sampler state.
+    private final int[] boundFaceIds = new int[6];
     // Upper bound for faceSize: what the GPU can allocate, hard-capped for VRAM sanity. Large
     // enough that an 8K window (~2160 px/face wanted) captures at full resolution.
     private final int maxFaceSize;
@@ -51,6 +52,8 @@ public class WindowManager {
 
     // Set by requestCapture(...); the next shader render writes the panorama window to this file.
     private volatile Path pendingCapture;
+    // Reused scratch buffer for the (test-only) screenshot read-back; grown on demand.
+    private ByteBuffer screenshotPixels;
 
     private static final class WindowPos {
         public final int x;
@@ -113,8 +116,9 @@ public class WindowManager {
         // Borderless or not, depending on the config.
         glfwWindowHint(GLFW_DECORATED, CONFIG.isBorderless() ? GLFW_FALSE : GLFW_TRUE);
 
-        // Create the window (no monitor, no shared context).
-        window = glfwCreateWindow(window_width, window_height, title, 0, 0);
+        // Create the window sharing Minecraft's GL context, so the panorama shader can sample the
+        // cube-face textures the game renderer fills GPU-side - no CPU read-back, no re-upload.
+        window = glfwCreateWindow(window_width, window_height, title, 0, mcWindow);
         if (window == 0) {
             glfwDefaultWindowHints();
             throw new IllegalStateException("Failed to create the panorama window");
@@ -197,27 +201,9 @@ public class WindowManager {
         glEnableVertexAttribArray(1);
 
 
-        for (int i = 0; i < textures.length; i++) {
-            textures[i] = glGenTextures();
-            glBindTexture(GL_TEXTURE_2D, textures[i]);
-            glTexImage2D(
-                    GL_TEXTURE_2D,
-                    0,
-                    GL_RGBA8,
-                    faceSize,
-                    faceSize,
-                    0,
-                    GL_RGBA,
-                    GL_UNSIGNED_BYTE,
-                    (ByteBuffer) null
-            );
-            texSize[i] = faceSize;
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            // GL_CLAMP was removed in GL 3.1; CLAMP_TO_EDGE keeps face edges from wrapping.
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        }
+        // The face textures themselves are owned by PanoramaManager (created through Blaze3D so the
+        // game renderer can blit into them) and live in the shared GL namespace; this window just
+        // binds their ids. Their sampler state is set once, the first time each id is seen.
 
         // The sampler -> texture-unit mapping never changes, so bind it once instead of
         // re-querying the uniform locations on every frame.
@@ -236,8 +222,6 @@ public class WindowManager {
         // Hand the context back to Minecraft.
         releaseContext();
     }
-
-    int[] textures = new int[6];
 
     private final int VBO;
     private final int VAO;
@@ -282,13 +266,15 @@ public class WindowManager {
     /**
      * Redraws the panorama window.
      *
-     * @param buffers        the six CPU face buffers
-     * @param incomingFaceSize edge length (px) of every buffer in {@code buffers}
-     * @param yawRadians      horizontal view rotation (0 = "front"/north face centred)
-     * @param pitchRadians    vertical view rotation (0 = horizon level)
-     * @param dirtyMask       bit {@code i} set => face {@code i} has new pixels to upload
+     * @param faceGlIds    GL texture names of the six cube faces (shared context), face order
+     *                     0=front(N) 1=right(E) 2=back(S) 3=left(W) 4=top 5=bottom
+     * @param incomingFaceSize edge length (px) of the face textures (unused now the window samples
+     *                     them directly with normalised coordinates; kept for signature stability)
+     * @param yawRadians   horizontal view rotation (0 = "front"/north face centred)
+     * @param pitchRadians vertical view rotation (0 = horizon level)
+     * @param dirtyMask    bit {@code i} set => face {@code i} was re-captured since the last present
      */
-    public void renderShader(ByteBuffer[] buffers, int incomingFaceSize,
+    public void renderShader(int[] faceGlIds, int incomingFaceSize,
                              float yawRadians, float pitchRadians, int dirtyMask) {
         boolean changed = dirtyMask != 0
                 || pendingCapture != null
@@ -314,7 +300,7 @@ public class WindowManager {
                 glUniform1f(uPitchLocation, pitchRadians);
             }
 
-            uploadFaces(buffers, dirtyMask, incomingFaceSize);
+            bindFaces(faceGlIds);
 
             glBindVertexArray(VAO);
             glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
@@ -342,7 +328,12 @@ public class WindowManager {
     private void writeWindowPng(Path path) {
         int w = window_width;
         int h = window_height;
-        ByteBuffer pixels = BufferUtils.createByteBuffer(w * h * 4).order(ByteOrder.LITTLE_ENDIAN);
+        int needed = w * h * 4;
+        if (screenshotPixels == null || screenshotPixels.capacity() < needed) {
+            screenshotPixels = BufferUtils.createByteBuffer(needed).order(ByteOrder.LITTLE_ENDIAN);
+        }
+        ByteBuffer pixels = screenshotPixels;
+        pixels.clear();
         glReadBuffer(GL_BACK);
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
         glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
@@ -384,23 +375,23 @@ public class WindowManager {
         glfwSwapBuffers(window);
     }
 
-    private void uploadFaces(ByteBuffer[] buffers, int dirtyMask, int incomingFaceSize) {
+    /**
+     * Binds the six shared face textures to units 0..5 for the shader. Their sampler state is set
+     * the first time an id appears (Blaze3D creates textures with a mipmapped min filter and no
+     * mip levels, which samples as black), and again after a resize swaps in fresh textures.
+     */
+    private void bindFaces(int[] faceGlIds) {
         for (int i = 0; i < 6; i++) {
-            if ((dirtyMask & (1 << i)) == 0) continue;
+            int id = faceGlIds[i];
             glActiveTexture(GL_TEXTURE0 + i);
-            glBindTexture(GL_TEXTURE_2D, textures[i]);
-            if (texSize[i] != incomingFaceSize) {
-                // Window was resized: grow/shrink this face's texture to the new capture resolution.
-                // Faces not yet re-captured keep their old texture (sampled with normalised coords,
-                // so it still displays fine) until their pixels arrive.
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, incomingFaceSize, incomingFaceSize, 0,
-                        GL_RGBA, GL_UNSIGNED_BYTE, buffers[i]);
-                texSize[i] = incomingFaceSize;
-            } else {
-                // Stream the new pixels into the already-allocated texture instead of
-                // reallocating its storage every frame with glTexImage2D.
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, incomingFaceSize, incomingFaceSize,
-                        GL_RGBA, GL_UNSIGNED_BYTE, buffers[i]);
+            glBindTexture(GL_TEXTURE_2D, id);
+            if (id != boundFaceIds[i]) {
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                // GL_CLAMP was removed in GL 3.1; CLAMP_TO_EDGE keeps face edges from wrapping.
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                boundFaceIds[i] = id;
             }
         }
     }

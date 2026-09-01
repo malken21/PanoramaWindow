@@ -3,12 +3,12 @@
   "id": "panorama_window",
   "version": "${version}",
   "name": "PanoramaWindow",
-  "description": "Real-time 360 degree panorama window rendering (one small client mixin, for billboard orientation).",
+  "description": "Real-time 360 degree panorama rendered into a separate window.",
   "authors": [
     "malken21"
   ],
   "contact": {
-    "repo": "https://github.com/malken21/PanoramaWindow-NoMixin"
+    "repo": "https://github.com/malken21/PanoramaWindow"
   },
   "license": "MIT",
   "icon": "assets/panorama_window/icon.png",

@@ -1,8 +1,9 @@
-# PanoramaWindow-NoMixin
+# PanoramaWindow
 
-A Minecraft Fabric mod that renders a live 360° panorama into a separate window. It was built to
-avoid mixins; it now carries a single small client-side mixin (`CameraMixin` /
-`SubmitNodeCollectionMixin`) purely to fix billboard orientation in the panorama - see
+A Minecraft Fabric mod that renders a live 360° panorama into a separate window. Turning the view
+never re-renders the world - the six world-locked cube faces are captured GPU-side and a fragment
+shader rotates the sampled direction to follow the player. Two small client-side mixins
+(`CameraMixin` / `SubmitNodeCollectionMixin`) fix billboard orientation in the panorama - see
 [Billboards](#billboards).
 
 The configuration is stored in `/config/panorama_window.json` in the game directory:
@@ -36,9 +37,13 @@ The faces only need re-rendering when the *scene* changes (the player moves, blo
 time passes). That capture runs from the client tick - Minecraft 26.1+ splits world
 rendering into a non-reentrant "extract" / "render" pipeline, so it can't be driven from a
 world-render event - and only `FacesPerCapture` faces are re-rendered per eligible tick, so
-there is no periodic "six full world renders in one frame" stall. Rendered faces are read
-back through the Blaze3D GPU abstraction one frame later and each face is uploaded to the
-window's textures only when it actually changes.
+there is no periodic "six full world renders in one frame" stall. If the player hasn't moved
+or turned, the sweep is skipped entirely and only redone every couple of seconds to pick up
+time of day, mobs and block changes.
+
+The panorama window **shares Minecraft's GL context**, so a rendered face is copied
+GPU-to-GPU (`copyTextureToTexture`) straight into the texture the window samples - no CPU
+read-back, no re-upload, even at 8K.
 
 The capture resolution is not a setting - it is derived from the window size (about a quarter
 of the width per face) so it always matches how big the window is. Resize the window and the
