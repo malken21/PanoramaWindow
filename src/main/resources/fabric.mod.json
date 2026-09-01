@@ -3,7 +3,7 @@
   "id": "panorama_window",
   "version": "${version}",
   "name": "PanoramaWindow",
-  "description": "Real-time 360 degree panorama window rendering without mixins.",
+  "description": "Real-time 360 degree panorama window rendering (one small client mixin, for billboard orientation).",
   "authors": [
     "malken21"
   ],
@@ -13,6 +13,9 @@
   "license": "MIT",
   "icon": "assets/panorama_window/icon.png",
   "environment": "client",
+  "mixins": [
+    "panorama_window.mixins.json"
+  ],
   "entrypoints": {
     "client": [
       "marumasa.panorama_window.client.PanoramaWindowClient"

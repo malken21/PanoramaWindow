@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "marumasa.panorama_window.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "client": [
+    "CameraMixin",
+    "SubmitNodeCollectionMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

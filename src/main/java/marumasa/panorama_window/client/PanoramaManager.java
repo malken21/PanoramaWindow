@@ -42,6 +42,15 @@ public class PanoramaManager {
     /** Number of full six-face sweeps that have finished reading back. Used by the client game test. */
     public static volatile long completedCaptures = 0;
 
+    /**
+     * View yaw (degrees) latched at the start of the current capture sweep. The billboard mixins
+     * ({@code CameraMixin} / {@code SubmitNodeCollectionMixin}) orient billboards to this one
+     * direction on every one of the six faces - instead of each face's own axis - so a billboard
+     * that lands on a face boundary no longer tears at the seam. The window shader then rotates the
+     * whole sphere to the live view, so a billboard captured facing the player still faces the player.
+     */
+    public static volatile float billboardYawDegrees = 180.0F;
+
     public static boolean isTaking() {
         return taking;
     }
@@ -150,9 +159,14 @@ public class PanoramaManager {
         if (++ticksSinceCapture < captureInterval) return;
         ticksSinceCapture = 0;
 
-        // At the start of a fresh sweep, pick up any window resize: re-render the whole sphere at
-        // the resolution the new window size wants. inFlight == 0 here, so no readback is mid-copy.
+        // At the start of a fresh sweep:
         if (nextFace == 0) {
+            // Latch the view yaw so every face of this sweep billboards (name tags etc.)
+            // consistently towards it - see billboardYawDegrees / the mixin classes.
+            billboardYawDegrees = player.getYRot();
+
+            // Pick up any window resize: re-render the whole sphere at the resolution the new
+            // window size wants. inFlight == 0 here, so no readback is mid-copy.
             int wanted = windows.faceSize();
             if (wanted != cameraSize) {
                 cameraSize = wanted;

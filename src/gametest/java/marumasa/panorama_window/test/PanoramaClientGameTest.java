@@ -62,6 +62,16 @@ public class PanoramaClientGameTest implements FabricClientGameTest {
             captures = assertKeptCapturing(captures, "after rotating the camera");
             savePanorama(context, "02-overworld-rot135.png");
 
+            // ---- Overworld: face the name-tagged armor stand (north-east, on a face seam) ----
+            context.runOnClient(client -> {
+                client.player.setXRot(0.0F);
+                client.player.setYRot(225.0F); // look north-east, towards (8.5, -8.5)
+            });
+            context.waitTicks(20);
+            captures = assertKeptCapturing(captures, "while facing the name tag");
+            savePanorama(context, "02c-overworld-nametag.png");
+            assertHasContent("02c-overworld-nametag.png");
+
             // ---- Overworld: look up (pitch follows the player, no re-render) ----
             faceNorth(context);
             context.waitTicks(10);
@@ -143,6 +153,10 @@ public class PanoramaClientGameTest implements FabricClientGameTest {
         server.runCommand("fill 16 100 -1 20 130 1 minecraft:redstone_block");
         server.runCommand("fill -1 100 16 1 130 20 minecraft:lapis_block");
         server.runCommand("fill -20 100 -1 -16 130 1 minecraft:emerald_block");
+        // A visible name tag (billboard) straddling the north/east cube-face boundary - the spot
+        // where per-face billboarding used to tear it. Exercises the billboard mixins during capture.
+        server.runCommand("summon minecraft:armor_stand 8.5 100.5 -8.5 "
+                + "{CustomName:'\"PanoramaTag\"',CustomNameVisible:1b,NoGravity:1b,Invulnerable:1b}");
         server.runCommand("execute as @a in minecraft:overworld run tp @s 0.5 100.5 0.5");
     }
 

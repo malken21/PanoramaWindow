@@ -1,6 +1,9 @@
 # PanoramaWindow-NoMixin
 
-A Minecraft Fabric mod that aims to enable real-time rendering of panoramas without the use of mixins.
+A Minecraft Fabric mod that renders a live 360° panorama into a separate window. It was built to
+avoid mixins; it now carries a single small client-side mixin (`CameraMixin` /
+`SubmitNodeCollectionMixin`) purely to fix billboard orientation in the panorama - see
+[Billboards](#billboards).
 
 The configuration is stored in `/config/panorama_window.json` in the game directory:
 
@@ -43,6 +46,23 @@ next full sweep re-captures at the new resolution. The per-face resolution is ca
 GPU's maximum texture size (and 8192 px); an 8K window (~3240 px/face wanted) is captured at
 full resolution on any GPU that reports an 8192+ limit.
 
+## Billboards
+
+Billboards - player / mob **name tags**, the score line under a name, fire on a burning entity,
+XP orbs, thrown items, fishing bobbers, the conduit eye - are camera-facing quads. A cube face is
+captured with the camera pointing along that face's axis, so vanilla would billboard each of them
+towards a *different* direction per face: a name tag near a face boundary is then drawn twice, once
+per face, 90° apart, and tears along the seam; one away from a face centre is skewed.
+
+Two tiny client mixins fix this, and only while the mod is capturing (the normal Minecraft view is
+untouched):
+
+- `CameraMixin` forces every billboard on all six faces to one fixed horizontal direction - the
+  view yaw latched at the start of the sweep - with zero pitch, so nothing tears at a seam and the
+  window shader tilts them with the view when you look up / down.
+- `SubmitNodeCollectionMixin` refines name tags further: each is turned to face the player's actual
+  position (the same in every face), so a name tag you look at is square-on and readable.
+
 ## Notes on the 26.2 port
 
 Minecraft 26.1+ ships unobfuscated, so the mod now builds against Mojang's official
@@ -70,6 +90,8 @@ Overworld -> Nether -> End -> Overworld while checking that:
 - the panorama window actually contains a rendered scene (not blank),
 - the panorama changes when the camera turns, when the player looks up, when the player moves,
   and between dimensions,
+- a named armour stand on a cube-face boundary keeps rendering (its name tag exercises the
+  billboard mixins during capture),
 - the player actually lands where the test teleported it (a fall-through would invalidate the
   captured scene).
 
