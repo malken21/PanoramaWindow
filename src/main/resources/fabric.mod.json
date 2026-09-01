@@ -3,8 +3,10 @@
   "id": "panorama_window",
   "version": "${version}",
   "name": "PanoramaWindow",
-  "description": "",
-  "authors": [],
+  "description": "Real-time 360 degree panorama window rendering without mixins.",
+  "authors": [
+    "malken21"
+  ],
   "contact": {
     "repo": "https://github.com/malken21/PanoramaWindow-NoMixin"
   },
@@ -21,7 +23,8 @@
   },
   "depends": {
     "fabricloader": ">=${loader_version}",
-    "fabric": "*",
-    "minecraft": "${minecraft_version}"
+    "fabric-api": "*",
+    "minecraft": "~${minecraft_version}",
+    "java": ">=25"
   }
 }

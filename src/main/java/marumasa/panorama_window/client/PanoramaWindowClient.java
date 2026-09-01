@@ -1,9 +1,9 @@
 package marumasa.panorama_window.client;
 
 import net.fabricmc.api.ClientModInitializer;
-import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
-import net.minecraft.client.gui.screen.TitleScreen;
+import net.minecraft.client.gui.screens.TitleScreen;
 
 import static marumasa.panorama_window.PanoramaWindow.CONFIG;
 
@@ -15,10 +15,22 @@ public class PanoramaWindowClient implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
 
-        WorldRenderEvents.END.register(context -> {
-            if (windows == null || panorama == null || PanoramaManager.isTaking()) return;
+        // Minecraft 26.1+ splits world rendering into an "extract" and a "render" phase that
+        // both run inside a non-reentrant frame graph, so the panorama can no longer be
+        // captured from inside a world-render event. Instead we mirror what the vanilla
+        // panorama screenshot does and drive the extra passes from the client tick, which
+        // runs between frames where re-rendering the level is safe.
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            if (windows == null || panorama == null) return;
+            if (client.level == null || client.player == null) {
+                windows.renderBlack();
+                return;
+            }
             panorama.take();
-            windows.renderShader(panorama.getBuffers());
+            if (panorama.hasFreshData()) {
+                windows.renderShader(panorama.getBuffers());
+                panorama.consume();
+            }
         });
 
         ScreenEvents.AFTER_INIT.register((client, screen, scaledWidth, scaledHeight) -> {
@@ -26,8 +38,7 @@ public class PanoramaWindowClient implements ClientModInitializer {
                 windows = new WindowManager(CONFIG.getWidth(), CONFIG.getHeight(), "Panorama", CONFIG.getCameraSize(), client);
                 panorama = new PanoramaManager(CONFIG.getCameraSize(), client);
             } else if (screen instanceof TitleScreen) {
-                // タイトル画面が表示された場合
-                // ウィンドウ全体を黒色を描画する
+                // The title screen is shown -> paint the panorama window black.
                 windows.renderBlack();
             }
         });

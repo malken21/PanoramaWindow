@@ -3,7 +3,6 @@ package marumasa.panorama_window.client;
 import marumasa.panorama_window.util.ModResource;
 
 import static marumasa.panorama_window.PanoramaWindow.LOGGER;
-import static org.lwjgl.opengl.GL.createCapabilities;
 import static org.lwjgl.opengl.GL31.*;
 
 public class ShaderManager {
@@ -11,9 +10,7 @@ public class ShaderManager {
     private final int shaderProgram;
 
     public ShaderManager() {
-        // OpenGLの初期化
-        createCapabilities();
-
+        // The GL capabilities for this context are set up by WindowManager before this runs.
         String vertexShaderSource, fragmentShaderSource;
         vertexShaderSource = ModResource.readString("shaders/quad.vsh");
         fragmentShaderSource = ModResource.readString("shaders/panorama.fsh");

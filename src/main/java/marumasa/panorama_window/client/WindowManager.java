@@ -1,17 +1,22 @@
 package marumasa.panorama_window.client;
 
-import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.Minecraft;
+import org.lwjgl.opengl.GL;
+import org.lwjgl.opengl.GLCapabilities;
 
 import java.nio.ByteBuffer;
 
 import static marumasa.panorama_window.PanoramaWindow.CONFIG;
 import static org.lwjgl.glfw.GLFW.*;
-import static org.lwjgl.glfw.GLFWErrorCallback.createPrint;
 import static org.lwjgl.opengl.GL31.*;
 
 public class WindowManager {
 
     public final long window;
+
+    private final long mcWindow;
+    private final GLCapabilities mcCapabilities;
+    private GLCapabilities panoramaCapabilities;
 
     private final int window_width;
     private final int window_height;
@@ -48,32 +53,44 @@ public class WindowManager {
         }
     }
 
-    public WindowManager(int width, int height, String title, int camera_size, MinecraftClient client) {
+    public WindowManager(int width, int height, String title, int camera_size, Minecraft client) {
         window_width = width;
         window_height = height;
         this.camera_size = camera_size;
-        // GLFWのエラコールバックを設定
-        createPrint(System.err).set();
-        // GLFWを初期化
+
+        // Remember Minecraft's context so we can hand it back after every operation.
+        this.mcWindow = client.getWindow().handle();
+        this.mcCapabilities = GL.getCapabilities();
+
+        // GLFW is already initialized by Minecraft; this is just defensive.
         if (!glfwInit()) {
             throw new IllegalStateException("Unable to initialize GLFW");
         }
-        // ウィンドウを作成時にウィンドウを表示する
+
+        glfwDefaultWindowHints();
+        // Show the window as soon as it is created.
         glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
-        // ウィンドウのサイズを変更不可にする
+        // The panorama window has a fixed size.
         glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-        // ボーダーレスにするかどうかを設定する
+        // Borderless or not, depending on the config.
         glfwWindowHint(GLFW_DECORATED, CONFIG.isBorderless() ? GLFW_FALSE : GLFW_TRUE);
-        // 垂直同期をオフにする
-        glfwSwapInterval(0);
-        // ウィンドウを作成
+
+        // Create the window (no monitor, no shared context).
         window = glfwCreateWindow(window_width, window_height, title, 0, 0);
-        // OpenGLコンテキストの初期化
+        if (window == 0) {
+            glfwDefaultWindowHints();
+            throw new IllegalStateException("Failed to create the panorama window");
+        }
+
+        // Switch to the panorama context and build its GL capabilities.
         glfwMakeContextCurrent(window);
-        // ウィンドウ全体を黒色を描画する
+        this.panoramaCapabilities = GL.createCapabilities();
+        // Disable v-sync for the panorama window.
+        glfwSwapInterval(0);
+        // Paint it black to start with.
         runBlack();
 
-        // マウスボタンコールバックの設定
+        // Drag the window around with the left mouse button.
         glfwSetMouseButtonCallback(window, (window, button, action, mods) -> {
             if (button == GLFW_MOUSE_BUTTON_LEFT) {
                 if (action == GLFW_PRESS) {
@@ -85,7 +102,6 @@ public class WindowManager {
             }
         });
 
-        // マウスカーソル位置コールバックの設定
         glfwSetCursorPosCallback(window, (window, xpos, ypos) -> {
             if (isDragging) {
                 windowPos = new WindowPos(window);
@@ -96,25 +112,24 @@ public class WindowManager {
             }
         });
 
-
         shaderManager = new ShaderManager();
 
-        // VAOとVBOの作成
-        int vaoID = glGenVertexArrays();
-        glBindVertexArray(vaoID);
+        // VAO and VBO.
+        VAO = glGenVertexArrays();
+        glBindVertexArray(VAO);
 
         float[] vertices = {
-                -1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, // 左下
-                1.0f, -1.0f, 0.0f, 1.0f, 0.0f, 0.0f, // 右下
-                1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, // 右上
-                -1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f  // 左上
+                -1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, // bottom left
+                1.0f, -1.0f, 0.0f, 1.0f, 0.0f, 0.0f, // bottom right
+                1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, // top right
+                -1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f  // top left
         };
 
         VBO = glGenBuffers();
         glBindBuffer(GL_ARRAY_BUFFER, VBO);
         glBufferData(GL_ARRAY_BUFFER, vertices, GL_STATIC_DRAW);
 
-        // 頂点属性の指定
+        // Vertex attributes.
         glVertexAttribPointer(0, 3, GL_FLOAT, false, 24, 0);
         glEnableVertexAttribArray(0);
         glVertexAttribPointer(1, 3, GL_FLOAT, false, 24, 12);
@@ -140,105 +155,87 @@ public class WindowManager {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
         }
-        // OpenGLコンテキストの初期化
-        glfwMakeContextCurrent(client.getWindow().getHandle());
+
+        // Hand the context back to Minecraft.
+        releaseContext();
     }
 
     int[] textures = new int[6];
 
     private final int VBO;
+    private final int VAO;
     private final ShaderManager shaderManager;
 
-    public void renderShader(ByteBuffer[] buffers) {
-        // OpenGLコンテキストの初期化
+    // Sampler uniform -> texture unit. Index matches the cube face order produced by PanoramaManager:
+    // 0=front, 1=right, 2=back, 3=left, 4=top, 5=bottom.
+    private static final String[] SAMPLER_NAMES = {
+            "texFront", "texRight", "texBack", "texLeft", "texTop", "texBottom"
+    };
+
+    private void makeContext() {
         glfwMakeContextCurrent(window);
+        GL.setCapabilities(panoramaCapabilities);
+    }
 
-        glViewport(0, 0, window_width, window_height);
-        loadUniforms(buffers, camera_size, camera_size);
-        runShader();
+    private void releaseContext() {
+        glfwMakeContextCurrent(mcWindow);
+        GL.setCapabilities(mcCapabilities);
+    }
 
-        // OpenGLコンテキストの初期化 ()
-        glfwMakeContextCurrent(MinecraftClient.getInstance().getWindow().getHandle());
+    public void renderShader(ByteBuffer[] buffers) {
+        makeContext();
+        try {
+            glViewport(0, 0, window_width, window_height);
+
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+            int program = shaderManager.getShaderProgram();
+            glUseProgram(program);
+
+            uploadFaces(buffers, camera_size, camera_size);
+            bindSamplers(program);
+
+            glBindVertexArray(VAO);
+            glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+            glfwSwapBuffers(window);
+        } finally {
+            releaseContext();
+        }
     }
 
     public void renderBlack() {
-        // OpenGLコンテキストの初期化
-        glfwMakeContextCurrent(window);
-
-        glViewport(0, 0, window_width, window_height);
-        runBlack();
-
-        // OpenGLコンテキストの初期化 ()
-        glfwMakeContextCurrent(MinecraftClient.getInstance().getWindow().getHandle());
+        makeContext();
+        try {
+            glViewport(0, 0, window_width, window_height);
+            runBlack();
+        } finally {
+            releaseContext();
+        }
     }
 
     private void runBlack() {
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT); // 画面をクリア
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // 画面をクリアする色
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // clear colour
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT); // clear the screen
         glfwSwapBuffers(window);
     }
 
-    // テクスチャ読み込み
-    private int loadTexture(ByteBuffer byteBuffer, int width, int height) {
-        // テクスチャの作成
-        int textureID = glGenTextures();
-        glBindTexture(GL_TEXTURE_2D, textureID);
-        // テクスチャパラメータの設定
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        // テクスチャデータの転送
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, byteBuffer);
-        return textureID;
+    private void bindSamplers(int program) {
+        for (int i = 0; i < SAMPLER_NAMES.length; i++) {
+            int location = glGetUniformLocation(program, SAMPLER_NAMES[i]);
+            if (location >= 0) {
+                glUniform1i(location, i);
+            }
+        }
     }
 
-    private void loadUniforms(ByteBuffer[] buffers, int width, int height) {
-
-        // texFront
-        glUniform1i(2, 0);
-
-        // texRight
-        glUniform1i(4, 1);
-
-        // texBack
-        glUniform1i(0, 2);
-
-        // texLeft
-        glUniform1i(3, 3);
-
-        // texTop
-        glUniform1i(5, 4);
-
-        // texBottom
-        glUniform1i(1, 5);
-
+    private void uploadFaces(ByteBuffer[] buffers, int width, int height) {
         for (int i = 0; i < 6; i++) {
-            switch (i) {
-                case 0 -> glActiveTexture(GL_TEXTURE0);
-                case 1 -> glActiveTexture(GL_TEXTURE1);
-                case 2 -> glActiveTexture(GL_TEXTURE2);
-                case 3 -> glActiveTexture(GL_TEXTURE3);
-                case 4 -> glActiveTexture(GL_TEXTURE4);
-                default -> glActiveTexture(GL_TEXTURE5);
-            }
+            glActiveTexture(GL_TEXTURE0 + i);
             glBindTexture(GL_TEXTURE_2D, textures[i]);
-            // テクスチャデータの転送
+            // upload the face data
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, buffers[i]);
         }
-    }
-
-    private void removeUniforms(int[] textures) {
-        for (int texture : textures) {
-            glDeleteTextures(texture);
-        }
-    }
-
-    private void runShader() {
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT); // 画面をクリア
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // 画面をクリアする色
-
-        glUseProgram(shaderManager.getShaderProgram());
-        glBindVertexArray(VBO);
-        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
-
-        glfwSwapBuffers(window);
     }
 }

@@ -1,132 +1,186 @@
 package marumasa.panorama_window.client;
 
-import net.minecraft.client.MinecraftClient;
-import net.minecraft.client.gl.Framebuffer;
-import net.minecraft.client.gl.SimpleFramebuffer;
-import net.minecraft.client.option.Perspective;
-import net.minecraft.client.render.RenderTickCounter;
-import net.minecraft.client.util.Window;
-import net.minecraft.entity.AreaEffectCloudEntity;
-import net.minecraft.entity.Entity;
-import net.minecraft.entity.EntityType;
+import com.mojang.blaze3d.buffers.GpuBuffer;
+import com.mojang.blaze3d.buffers.GpuBufferSlice;
+import com.mojang.blaze3d.pipeline.RenderTarget;
+import com.mojang.blaze3d.platform.Window;
+import com.mojang.blaze3d.systems.GpuDevice;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.textures.GpuTexture;
+import net.minecraft.client.Camera;
+import net.minecraft.client.DeltaTracker;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.player.LocalPlayer;
 import org.lwjgl.BufferUtils;
 
 import java.nio.ByteBuffer;
 import java.util.stream.IntStream;
 
 import static marumasa.panorama_window.PanoramaWindow.LOGGER;
-import static net.minecraft.client.MinecraftClient.IS_SYSTEM_MAC;
-import static org.lwjgl.opengl.GL31.*;
 
+/**
+ * Renders the six cube faces of the panorama by re-running Minecraft's world renderer once
+ * per direction, then asynchronously copies each rendered face back into a CPU {@link ByteBuffer}
+ * so it can be uploaded into the mod's separate OpenGL window.
+ *
+ * <p>Since Minecraft 26.1 the renderer no longer exposes a synchronous {@code renderWorld} call
+ * and texture read-back goes through the Blaze3D GPU abstraction, so the pixels arrive one frame
+ * later via a fenced task. {@link #hasFreshData()} reports when a full set of six faces is ready.
+ */
 public class PanoramaManager {
-    private static boolean taking = false;
+
+    private static volatile boolean taking = false;
+
+    /** Number of full six-face sets that have finished reading back. Used by the client game test. */
+    public static volatile long completedCaptures = 0;
 
     public static boolean isTaking() {
         return taking;
     }
 
-    private static void take(ByteBuffer[] buffers, MinecraftClient client, int width, int height) {
-        taking = true;
-
-        Window window = client.getWindow();
-        Entity camera_default = client.cameraEntity;
-        if (client.player == null || camera_default == null || client.gameRenderer == null || client.worldRenderer == null || client.world == null)
-            return;
-
-        int i = window.getFramebufferWidth();
-        int j = window.getFramebufferHeight();
-        Perspective k = client.options.getPerspective();
-        client.options.setPerspective(Perspective.FIRST_PERSON);
-
-        Framebuffer framebuffer = new SimpleFramebuffer(width, height, true, IS_SYSTEM_MAC);
-        float yaw = client.player.getYaw();
-        client.gameRenderer.setBlockOutlineEnabled(false);
-
-        Entity camera = new AreaEffectCloudEntity(EntityType.AREA_EFFECT_CLOUD, client.world);
-        camera.copyPositionAndRotation(client.player);
-        client.setCameraEntity(camera);
-
-        try {
-            client.gameRenderer.setRenderingPanorama(true);
-            client.worldRenderer.reloadTransparencyPostProcessor();
-            window.setFramebufferWidth(width);
-            window.setFramebufferHeight(height);
-
-            for (int l = 0; l < 6; l++) {
-                switch (l) {
-                    case 0:
-                        camera.setYaw(yaw);
-                        camera.setPitch(0.0F);
-                        break;
-                    case 1:
-                        camera.setYaw((yaw + 90.0F) % 360.0F);
-                        camera.setPitch(0.0F);
-                        break;
-                    case 2:
-                        camera.setYaw((yaw + 180.0F) % 360.0F);
-                        camera.setPitch(0.0F);
-                        break;
-                    case 3:
-                        camera.setYaw((yaw - 90.0F) % 360.0F);
-                        camera.setPitch(0.0F);
-                        break;
-                    case 4:
-                        camera.setYaw(yaw);
-                        camera.setPitch(-90.0F);
-                        break;
-                    case 5:
-                    default:
-                        camera.setYaw(yaw);
-                        camera.setPitch(90.0F);
-                }
-
-                camera.prevYaw = camera.getYaw();
-                camera.prevPitch = camera.getPitch();
-                framebuffer.beginWrite(true);
-                client.gameRenderer.renderWorld(RenderTickCounter.ZERO);
-
-                // テクスチャのバインド
-                glBindTexture(GL_TEXTURE_2D, framebuffer.getColorAttachment());
-                glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, buffers[l]);
-            }
-        } catch (Exception exception) {
-            LOGGER.error("Couldn't take images", exception);
-        } finally {
-            client.setCameraEntity(camera_default);
-            camera.remove(Entity.RemovalReason.KILLED);
-            client.options.setPerspective(k);
-
-            client.gameRenderer.setBlockOutlineEnabled(true);
-            window.setFramebufferWidth(i);
-            window.setFramebufferHeight(j);
-            framebuffer.delete();
-            client.gameRenderer.setRenderingPanorama(false);
-            client.worldRenderer.reloadTransparencyPostProcessor();
-            client.getFramebuffer().beginWrite(true);
-            client.gameRenderer.renderWorld(RenderTickCounter.ZERO);
-        }
-        taking = false;
-    }
-
-    private final int camera_size;
-    private final MinecraftClient client;
+    private final int cameraSize;
+    private final Minecraft client;
     private final ByteBuffer[] buffers;
 
-    public PanoramaManager(int camera_size, MinecraftClient client) {
-        this.client = client;
-        this.camera_size = camera_size;
-        // 6個の ByteBuffer 型の配列を生成する
-        this.buffers = IntStream.range(0, 6).mapToObj(i ->
-                // 配列の内容
-                BufferUtils.createByteBuffer(this.camera_size * this.camera_size * 4)
-        ).toArray(ByteBuffer[]::new);
-    }
+    private GpuBuffer[] readbackBuffers;
+    private volatile int pendingFaces = 0;
+    private volatile boolean freshData = false;
 
-    public void take() {
-        take(buffers, client, this.camera_size, this.camera_size);
+    public PanoramaManager(int cameraSize, Minecraft client) {
+        this.client = client;
+        this.cameraSize = cameraSize;
+        // Six CPU-side RGBA buffers, one per cube face.
+        this.buffers = IntStream.range(0, 6)
+                .mapToObj(i -> BufferUtils.createByteBuffer(this.cameraSize * this.cameraSize * 4))
+                .toArray(ByteBuffer[]::new);
     }
 
     public ByteBuffer[] getBuffers() {
         return buffers;
+    }
+
+    /** True once every face of the most recent capture has been copied back to the CPU. */
+    public boolean hasFreshData() {
+        return freshData;
+    }
+
+    /** Marks the current set of faces as consumed so the next capture can be started. */
+    public void consume() {
+        freshData = false;
+    }
+
+    public void take() {
+        if (!RenderSystem.isOnRenderThread()) return;
+        // A previous capture is still being read back - don't stomp on those buffers.
+        if (pendingFaces > 0) return;
+
+        final LocalPlayer player = client.player;
+        if (player == null || client.level == null || client.gameRenderer == null) return;
+
+        final Window window = client.getWindow();
+        final RenderTarget target = client.gameRenderer.mainRenderTarget();
+        final Camera camera = client.gameRenderer.mainCamera();
+        final GpuDevice device = RenderSystem.getDevice();
+
+        final int originalWidth = window.getWidth();
+        final int originalHeight = window.getHeight();
+        final float yaw = player.getYRot();
+        final float pitch = player.getXRot();
+        final float prevYaw = player.yRotO;
+        final float prevPitch = player.xRotO;
+
+        taking = true;
+        try {
+            client.gameRenderer.setRenderBlockOutline(false);
+            ensureReadbackBuffers(device);
+            pendingFaces = 6;
+            freshData = false;
+
+            camera.enablePanoramicMode();
+            window.setWidth(cameraSize);
+            window.setHeight(cameraSize);
+            target.resize(cameraSize, cameraSize);
+
+            for (int face = 0; face < 6; face++) {
+                switch (face) {
+                    case 0 -> { player.setYRot(yaw); player.setXRot(0.0F); }
+                    case 1 -> { player.setYRot((yaw + 90.0F) % 360.0F); player.setXRot(0.0F); }
+                    case 2 -> { player.setYRot((yaw + 180.0F) % 360.0F); player.setXRot(0.0F); }
+                    case 3 -> { player.setYRot((yaw - 90.0F) % 360.0F); player.setXRot(0.0F); }
+                    case 4 -> { player.setYRot(yaw); player.setXRot(-90.0F); }
+                    default -> { player.setYRot(yaw); player.setXRot(90.0F); }
+                }
+
+                player.yRotO = player.getYRot();
+                player.xRotO = player.getXRot();
+
+                client.gameRenderer.update(DeltaTracker.ONE);
+                client.gameRenderer.extract(DeltaTracker.ONE, true);
+                client.gameRenderer.renderLevel(DeltaTracker.ONE);
+
+                queueReadback(device, target, face);
+            }
+        } catch (Exception exception) {
+            LOGGER.error("Couldn't take panorama images", exception);
+            pendingFaces = 0;
+        } finally {
+            player.setYRot(yaw);
+            player.setXRot(pitch);
+            player.yRotO = prevYaw;
+            player.xRotO = prevPitch;
+            client.gameRenderer.setRenderBlockOutline(true);
+            window.setWidth(originalWidth);
+            window.setHeight(originalHeight);
+            target.resize(originalWidth, originalHeight);
+            camera.disablePanoramicMode();
+            taking = false;
+        }
+    }
+
+    private void ensureReadbackBuffers(GpuDevice device) {
+        if (readbackBuffers != null) return;
+        long size = (long) cameraSize * cameraSize * 4L;
+        readbackBuffers = new GpuBuffer[6];
+        for (int i = 0; i < 6; i++) {
+            readbackBuffers[i] = device.createBuffer(
+                    () -> "panorama_window readback",
+                    GpuBuffer.USAGE_MAP_READ | GpuBuffer.USAGE_COPY_DST,
+                    size
+            );
+        }
+    }
+
+    private void queueReadback(GpuDevice device, RenderTarget target, int face) {
+        GpuTexture color = target.getColorTexture();
+        if (color == null) {
+            pendingFaces = Math.max(0, pendingFaces - 1);
+            return;
+        }
+
+        final GpuBuffer readback = readbackBuffers[face];
+        final int index = face;
+
+        device.createCommandEncoder().copyTextureToBuffer(color, readback, 0L, () -> {
+            try (GpuBufferSlice.MappedView view = readback.map(true, false)) {
+                ByteBuffer src = view.data();
+                ByteBuffer dst = buffers[index];
+                dst.clear();
+                int count = Math.min(src.remaining(), dst.remaining());
+                int srcLimit = src.limit();
+                src.limit(src.position() + count);
+                dst.put(src);
+                src.limit(srcLimit);
+                dst.flip();
+            } catch (Exception e) {
+                LOGGER.error("Couldn't read back panorama face {}", index, e);
+            } finally {
+                int remaining = --pendingFaces;
+                if (remaining <= 0) {
+                    pendingFaces = 0;
+                    freshData = true;
+                    completedCaptures++;
+                }
+            }
+        }, 0);
     }
 }
