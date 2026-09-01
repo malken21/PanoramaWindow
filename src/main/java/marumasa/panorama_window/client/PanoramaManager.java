@@ -46,6 +46,11 @@ public class PanoramaManager {
     private volatile int pendingFaces = 0;
     private volatile boolean freshData = false;
 
+    // The client level/player instances are swapped out on a dimension change (and the level
+    // renderer reloads); wait a few ticks before re-rendering the world again.
+    private Object lastLevel;
+    private int settleTicks = 0;
+
     public PanoramaManager(int cameraSize, Minecraft client) {
         this.client = client;
         this.cameraSize = cameraSize;
@@ -76,6 +81,17 @@ public class PanoramaManager {
 
         final LocalPlayer player = client.player;
         if (player == null || client.level == null || client.gameRenderer == null) return;
+
+        // Settle after a dimension change / (re)join before poking the world renderer again.
+        if (client.level != lastLevel) {
+            lastLevel = client.level;
+            settleTicks = 30;
+        }
+        if (settleTicks > 0) {
+            settleTicks--;
+            return;
+        }
+        if (!player.isAlive()) return;
 
         final Window window = client.getWindow();
         final RenderTarget target = client.gameRenderer.mainRenderTarget();

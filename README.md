@@ -35,11 +35,13 @@ An automated in-world test is available:
 ./gradlew runClientGameTest
 ```
 
-It creates a world, then rotates the camera, looks around and walks while checking that:
+It builds a ring of coloured landmark pillars, then rotates the camera, walks, and travels
+Overworld -> Nether -> End -> Overworld while checking that:
 
-- the six-face capture keeps completing without crashing or stalling,
+- the six-face capture keeps completing without crashing or stalling (including across
+  dimension changes),
 - the panorama window actually contains a rendered scene (not blank),
-- the panorama changes when the camera rotates and when the player moves.
+- the panorama changes when the camera rotates, when the player moves, and between dimensions.
 
 The rendered panorama frames are written to
 `build/run/clientGameTest/panorama-test-output/`.
