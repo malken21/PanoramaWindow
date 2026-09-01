@@ -46,10 +46,13 @@ public class PanoramaManager {
         return taking;
     }
 
-    private final int cameraSize;
+    // Cube-face capture resolution. Follows the panorama window's size: re-read from
+    // windows.faceSize() at each sweep boundary and the buffers reallocated to match.
+    private int cameraSize;
     private final int captureInterval;
     private final int facesPerCapture;
     private final Minecraft client;
+    private final WindowManager windows;
     private final ByteBuffer[] buffers;
 
     private GpuBuffer[] readbackBuffers;
@@ -70,9 +73,10 @@ public class PanoramaManager {
     private Object lastLevel;
     private int settleTicks = 0;
 
-    public PanoramaManager(int cameraSize, int captureInterval, int facesPerCapture, Minecraft client) {
+    public PanoramaManager(int captureInterval, int facesPerCapture, Minecraft client, WindowManager windows) {
         this.client = client;
-        this.cameraSize = cameraSize;
+        this.windows = windows;
+        this.cameraSize = windows.faceSize();
         this.captureInterval = Math.max(1, captureInterval);
         this.facesPerCapture = Math.min(6, Math.max(1, facesPerCapture));
         // Six CPU-side RGBA buffers, one per cube face.
@@ -83,6 +87,11 @@ public class PanoramaManager {
 
     public ByteBuffer[] getBuffers() {
         return buffers;
+    }
+
+    /** Edge length (px) of the current face buffers - hand this to the window with the buffers. */
+    public int faceSize() {
+        return cameraSize;
     }
 
     /** True once every face has been read back at least once (the window would otherwise show gaps). */
@@ -141,6 +150,16 @@ public class PanoramaManager {
         if (++ticksSinceCapture < captureInterval) return;
         ticksSinceCapture = 0;
 
+        // At the start of a fresh sweep, pick up any window resize: re-render the whole sphere at
+        // the resolution the new window size wants. inFlight == 0 here, so no readback is mid-copy.
+        if (nextFace == 0) {
+            int wanted = windows.faceSize();
+            if (wanted != cameraSize) {
+                cameraSize = wanted;
+                reallocateBuffers();
+            }
+        }
+
         final int count = Math.min(facesPerCapture, 6);
         final Window window = client.getWindow();
         final RenderTarget target = client.gameRenderer.mainRenderTarget();
@@ -194,6 +213,27 @@ public class PanoramaManager {
         }
 
         nextFace = (nextFace + count) % 6;
+    }
+
+    /**
+     * Resizes the CPU face buffers (and drops the GPU readback buffers so they are rebuilt at the
+     * new size) after the window changed size. Called only at a sweep boundary with no readback in
+     * flight. Pending dirty bits are cleared: those pixels are the old size and would not fit the
+     * resized textures - the faces keep their current texture until this sweep re-captures them.
+     */
+    private void reallocateBuffers() {
+        for (int i = 0; i < 6; i++) {
+            buffers[i] = BufferUtils.createByteBuffer(cameraSize * cameraSize * 4);
+        }
+        if (readbackBuffers != null) {
+            for (GpuBuffer buffer : readbackBuffers) {
+                if (buffer != null) buffer.close();
+            }
+            readbackBuffers = null;
+        }
+        synchronized (dirtyLock) {
+            dirtyMask = 0;
+        }
     }
 
     private void ensureReadbackBuffers(GpuDevice device) {

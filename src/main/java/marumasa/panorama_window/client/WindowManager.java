@@ -28,7 +28,12 @@ public class WindowManager {
     // Updated from the GLFW framebuffer-size callback when the user resizes the window.
     private volatile int window_width;
     private volatile int window_height;
-    private final int camera_size;
+
+    // Cube-face capture resolution that matches the current window size. Recomputed on resize;
+    // PanoramaManager polls faceSize() and reallocates its buffers to match at a sweep boundary,
+    // then the resized pixels flow in and uploadFaces() grows/shrinks each GL texture to fit.
+    private volatile int faceSize;
+    private final int[] texSize = new int[6];
 
     private WindowPos windowPos;
     private CursorPos cursorPos;
@@ -71,10 +76,21 @@ public class WindowManager {
         }
     }
 
-    public WindowManager(int width, int height, String title, int camera_size, Minecraft client) {
+    /** Cube-face capture resolution that keeps up with a panorama window this big (px). */
+    static int faceSizeFor(int windowWidth, int windowHeight) {
+        // The window shows the full 360x180 equirectangular field: 360 deg across the width, 180 deg
+        // down the height. A cube face spans 90 deg, so to roughly match the window's angular pixel
+        // density a face needs about width/4 (and height/2) pixels; * 1.5 for headroom, since the
+        // gnomonic face projection undersamples toward its edges.
+        int ideal = (int) Math.ceil(1.5 * Math.max(windowWidth / 4.0, windowHeight / 2.0));
+        int step = 128; // quantise so a slow resize drag doesn't reallocate textures every pixel
+        int rounded = ((ideal + step - 1) / step) * step;
+        return Math.min(2048, Math.max(256, rounded));
+    }
+
+    public WindowManager(int width, int height, String title, Minecraft client) {
         window_width = width;
         window_height = height;
-        this.camera_size = camera_size;
 
         // Remember Minecraft's context so we can hand it back after every operation.
         this.mcWindow = client.getWindow().handle();
@@ -138,10 +154,12 @@ public class WindowManager {
         glfwGetFramebufferSize(window, fbWidth, fbHeight);
         window_width = fbWidth[0];
         window_height = fbHeight[0];
+        faceSize = faceSizeFor(window_width, window_height);
         glfwSetFramebufferSizeCallback(window, (win, w, h) -> {
             if (w > 0 && h > 0) {
                 window_width = w;
                 window_height = h;
+                faceSize = faceSizeFor(w, h);
                 // Force the next renderShader to actually redraw at the new size.
                 lastYaw = Float.NaN;
             }
@@ -178,13 +196,14 @@ public class WindowManager {
                     GL_TEXTURE_2D,
                     0,
                     GL_RGBA8,
-                    this.camera_size,
-                    this.camera_size,
+                    faceSize,
+                    faceSize,
                     0,
                     GL_RGBA,
                     GL_UNSIGNED_BYTE,
                     (ByteBuffer) null
             );
+            texSize[i] = faceSize;
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             // GL_CLAMP was removed in GL 3.1; CLAMP_TO_EDGE keeps face edges from wrapping.
@@ -239,15 +258,30 @@ public class WindowManager {
         this.pendingCapture = path;
     }
 
+    /** Cube-face capture resolution the current window size wants. Polled by {@link PanoramaManager}. */
+    public int faceSize() {
+        return faceSize;
+    }
+
+    /** The panorama window's current size in screen coordinates (not framebuffer pixels). */
+    public int[] windowSize() {
+        int[] w = new int[1];
+        int[] h = new int[1];
+        glfwGetWindowSize(window, w, h);
+        return new int[]{w[0], h[0]};
+    }
+
     /**
      * Redraws the panorama window.
      *
-     * @param buffers     the six CPU face buffers
-     * @param yawRadians   horizontal view rotation (0 = "front"/north face centred)
-     * @param pitchRadians vertical view rotation (0 = horizon level)
-     * @param dirtyMask    bit {@code i} set => face {@code i} has new pixels to upload
+     * @param buffers        the six CPU face buffers
+     * @param incomingFaceSize edge length (px) of every buffer in {@code buffers}
+     * @param yawRadians      horizontal view rotation (0 = "front"/north face centred)
+     * @param pitchRadians    vertical view rotation (0 = horizon level)
+     * @param dirtyMask       bit {@code i} set => face {@code i} has new pixels to upload
      */
-    public void renderShader(ByteBuffer[] buffers, float yawRadians, float pitchRadians, int dirtyMask) {
+    public void renderShader(ByteBuffer[] buffers, int incomingFaceSize,
+                             float yawRadians, float pitchRadians, int dirtyMask) {
         boolean changed = dirtyMask != 0
                 || pendingCapture != null
                 || isBlack
@@ -272,7 +306,7 @@ public class WindowManager {
                 glUniform1f(uPitchLocation, pitchRadians);
             }
 
-            uploadFaces(buffers, dirtyMask);
+            uploadFaces(buffers, dirtyMask, incomingFaceSize);
 
             glBindVertexArray(VAO);
             glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
@@ -342,14 +376,24 @@ public class WindowManager {
         glfwSwapBuffers(window);
     }
 
-    private void uploadFaces(ByteBuffer[] buffers, int dirtyMask) {
+    private void uploadFaces(ByteBuffer[] buffers, int dirtyMask, int incomingFaceSize) {
         for (int i = 0; i < 6; i++) {
             if ((dirtyMask & (1 << i)) == 0) continue;
             glActiveTexture(GL_TEXTURE0 + i);
             glBindTexture(GL_TEXTURE_2D, textures[i]);
-            // Stream the new pixels into the already-allocated texture instead of
-            // reallocating its storage every frame with glTexImage2D.
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, camera_size, camera_size, GL_RGBA, GL_UNSIGNED_BYTE, buffers[i]);
+            if (texSize[i] != incomingFaceSize) {
+                // Window was resized: grow/shrink this face's texture to the new capture resolution.
+                // Faces not yet re-captured keep their old texture (sampled with normalised coords,
+                // so it still displays fine) until their pixels arrive.
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, incomingFaceSize, incomingFaceSize, 0,
+                        GL_RGBA, GL_UNSIGNED_BYTE, buffers[i]);
+                texSize[i] = incomingFaceSize;
+            } else {
+                // Stream the new pixels into the already-allocated texture instead of
+                // reallocating its storage every frame with glTexImage2D.
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, incomingFaceSize, incomingFaceSize,
+                        GL_RGBA, GL_UNSIGNED_BYTE, buffers[i]);
+            }
         }
     }
 }

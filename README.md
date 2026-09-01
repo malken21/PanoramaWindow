@@ -6,8 +6,7 @@ The configuration is stored in `/config/panorama_window.json` in the game direct
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `CameraSize` | `512` | Resolution (px) of each of the six captured cube faces. Lower values cut GPU cost sharply. |
-| `Width` / `Height` | `1280` / `720` | Initial size of the panorama window. The window is resizable; the shader pass re-fits to the framebuffer. |
+| `Width` / `Height` | `1280` / `720` | Panorama window size. The window is resizable; whatever size you leave it at is written back here on quit. |
 | `Borderless` | `false` | Hide the window's title bar / border. |
 | `CaptureInterval` | `2` | Client ticks between capture batches. Only limits how often the world is re-rendered to refresh the (world-locked) faces - the window itself still redraws every frame. |
 | `FacesPerCapture` | `2` | How many of the six faces to re-render per batch (`1`..`6`). Lower spreads the GPU cost over more ticks; `6` restores the old "re-render everything at once" burst. |
@@ -37,6 +36,10 @@ world-render event - and only `FacesPerCapture` faces are re-rendered per eligib
 there is no periodic "six full world renders in one frame" stall. Rendered faces are read
 back through the Blaze3D GPU abstraction one frame later and each face is uploaded to the
 window's textures only when it actually changes.
+
+The capture resolution is not a setting - it is derived from the window size (about a quarter
+of the width, capped at 2048 px per face) so it always matches how big the window is. Resize
+the window and the next full sweep re-captures at the new resolution.
 
 ## Notes on the 26.2 port
 

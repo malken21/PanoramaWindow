@@ -1,6 +1,7 @@
 package marumasa.panorama_window.client;
 
 import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
 import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
@@ -56,11 +57,21 @@ public class PanoramaWindowClient implements ClientModInitializer {
 
         ScreenEvents.AFTER_INIT.register((client, screen, scaledWidth, scaledHeight) -> {
             if (windows == null || panorama == null) {
-                windows = new WindowManager(CONFIG.getWidth(), CONFIG.getHeight(), "Panorama", CONFIG.getCameraSize(), client);
-                panorama = new PanoramaManager(CONFIG.getCameraSize(), CONFIG.getCaptureInterval(), CONFIG.getFacesPerCapture(), client);
+                windows = new WindowManager(CONFIG.getWidth(), CONFIG.getHeight(), "Panorama", client);
+                panorama = new PanoramaManager(CONFIG.getCaptureInterval(), CONFIG.getFacesPerCapture(), client, windows);
             } else if (screen instanceof TitleScreen) {
                 // The title screen is shown -> paint the panorama window black.
                 windows.renderBlack();
+            }
+        });
+
+        // Remember where the user left the panorama window so it reopens the same size.
+        ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
+            if (windows != null) {
+                int[] size = windows.windowSize();
+                if (size[0] > 0 && size[1] > 0) {
+                    CONFIG.setWindowSize(size[0], size[1]);
+                }
             }
         });
     }
@@ -94,6 +105,7 @@ public class PanoramaWindowClient implements ClientModInitializer {
         float perTickPitch = pitch - client.player.xRotO;
         float pitchDegrees = Math.abs(perTickPitch) < 30.0F ? pitch - perTickPitch * (1.0F - partialTick) : pitch;
         float pitchRadians = (float) Math.toRadians(pitchDegrees);
-        windows.renderShader(panorama.getBuffers(), yawRadians, pitchRadians, panorama.drainDirtyFaces());
+        windows.renderShader(panorama.getBuffers(), panorama.faceSize(),
+                yawRadians, pitchRadians, panorama.drainDirtyFaces());
     }
 }
