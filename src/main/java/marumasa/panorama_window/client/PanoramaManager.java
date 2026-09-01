@@ -94,7 +94,6 @@ public class PanoramaManager {
             client.gameRenderer.setRenderBlockOutline(false);
             ensureReadbackBuffers(device);
             pendingFaces = 6;
-            freshData = false;
 
             camera.enablePanoramicMode();
             window.setWidth(cameraSize);

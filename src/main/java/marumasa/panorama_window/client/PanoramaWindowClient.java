@@ -5,12 +5,26 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
 import net.minecraft.client.gui.screens.TitleScreen;
 
+import java.nio.file.Path;
+
 import static marumasa.panorama_window.PanoramaWindow.CONFIG;
 
 public class PanoramaWindowClient implements ClientModInitializer {
 
     static WindowManager windows;
     static PanoramaManager panorama;
+
+    /** True once the panorama window and capture manager are both live. */
+    public static boolean isReady() {
+        return windows != null && panorama != null;
+    }
+
+    /** Asks the mod to save the next panorama-window frame to {@code path} (used by the client game test). */
+    public static void requestPanoramaScreenshot(Path path) {
+        if (windows != null) {
+            windows.requestCapture(path);
+        }
+    }
 
     @Override
     public void onInitializeClient() {
@@ -26,11 +40,13 @@ public class PanoramaWindowClient implements ClientModInitializer {
                 windows.renderBlack();
                 return;
             }
-            panorama.take();
+            // Draw the most recently finished cube-map set (its faces arrive a frame after capture)...
             if (panorama.hasFreshData()) {
                 windows.renderShader(panorama.getBuffers());
                 panorama.consume();
             }
+            // ...then start capturing the next one.
+            panorama.take();
         });
 
         ScreenEvents.AFTER_INIT.register((client, screen, scaledWidth, scaledHeight) -> {

@@ -29,8 +29,17 @@ panorama window updates at the client tick rate (20 Hz) rather than the full fra
 
 ### Testing
 
-An automated in-world smoke test is available:
+An automated in-world test is available:
 
 ```bash
 ./gradlew runClientGameTest
 ```
+
+It creates a world, then rotates the camera, looks around and walks while checking that:
+
+- the six-face capture keeps completing without crashing or stalling,
+- the panorama window actually contains a rendered scene (not blank),
+- the panorama changes when the camera rotates and when the player moves.
+
+The rendered panorama frames are written to
+`build/run/clientGameTest/panorama-test-output/`.

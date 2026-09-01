@@ -1,12 +1,19 @@
 package marumasa.panorama_window.client;
 
+import com.mojang.blaze3d.platform.NativeImage;
 import net.minecraft.client.Minecraft;
+import org.lwjgl.BufferUtils;
 import org.lwjgl.opengl.GL;
 import org.lwjgl.opengl.GLCapabilities;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 import static marumasa.panorama_window.PanoramaWindow.CONFIG;
+import static marumasa.panorama_window.PanoramaWindow.LOGGER;
 import static org.lwjgl.glfw.GLFW.*;
 import static org.lwjgl.opengl.GL31.*;
 
@@ -25,6 +32,9 @@ public class WindowManager {
     private WindowPos windowPos;
     private CursorPos cursorPos;
     private boolean isDragging = false;
+
+    // Set by requestCapture(...); the next shader render writes the panorama window to this file.
+    private volatile Path pendingCapture;
 
     private static final class WindowPos {
         public final int x;
@@ -182,6 +192,11 @@ public class WindowManager {
         GL.setCapabilities(mcCapabilities);
     }
 
+    /** Requests that the next {@link #renderShader} write the panorama window to {@code path} as a PNG. */
+    public void requestCapture(Path path) {
+        this.pendingCapture = path;
+    }
+
     public void renderShader(ByteBuffer[] buffers) {
         makeContext();
         try {
@@ -199,9 +214,40 @@ public class WindowManager {
             glBindVertexArray(VAO);
             glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
 
+            Path capture = pendingCapture;
+            if (capture != null) {
+                pendingCapture = null;
+                writeWindowPng(capture);
+            }
+
             glfwSwapBuffers(window);
         } finally {
             releaseContext();
+        }
+    }
+
+    private void writeWindowPng(Path path) {
+        int w = window_width;
+        int h = window_height;
+        ByteBuffer pixels = BufferUtils.createByteBuffer(w * h * 4).order(ByteOrder.LITTLE_ENDIAN);
+        glReadBuffer(GL_BACK);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+
+        try (NativeImage image = new NativeImage(w, h, false)) {
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    // glReadPixels is bottom-up; NativeImage is top-down.
+                    image.setPixelABGR(x, h - 1 - y, pixels.getInt((x + y * w) * 4) | 0xFF000000);
+                }
+            }
+            if (path.toAbsolutePath().getParent() != null) {
+                Files.createDirectories(path.toAbsolutePath().getParent());
+            }
+            image.writeToFile(path);
+            LOGGER.info("Wrote panorama window screenshot to {}", path.toAbsolutePath());
+        } catch (IOException e) {
+            LOGGER.error("Couldn't write panorama window screenshot", e);
         }
     }
 
