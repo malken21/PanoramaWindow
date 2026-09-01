@@ -88,6 +88,12 @@ public class PanoramaWindowClient implements ClientModInitializer {
         float yawDegrees = Math.abs(perTickTurn) < 30.0F ? yaw - perTickTurn * (1.0F - partialTick) : yaw;
         // Face 0 ("front") is captured looking north (yaw 180); shift so a north-facing view is centred.
         float yawRadians = (float) Math.toRadians(yawDegrees - 180.0F);
-        windows.renderShader(panorama.getBuffers(), yawRadians, panorama.drainDirtyFaces());
+        // Same tick interpolation for pitch. The faces cover the full sphere (top / bottom included),
+        // so following the player's pitch is just another rotation in the window shader - no re-render.
+        float pitch = client.player.getXRot();
+        float perTickPitch = pitch - client.player.xRotO;
+        float pitchDegrees = Math.abs(perTickPitch) < 30.0F ? pitch - perTickPitch * (1.0F - partialTick) : pitch;
+        float pitchRadians = (float) Math.toRadians(pitchDegrees);
+        windows.renderShader(panorama.getBuffers(), yawRadians, pitchRadians, panorama.drainDirtyFaces());
     }
 }

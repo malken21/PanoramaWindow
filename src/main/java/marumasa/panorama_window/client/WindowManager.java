@@ -25,8 +25,9 @@ public class WindowManager {
     private final GLCapabilities mcCapabilities;
     private GLCapabilities panoramaCapabilities;
 
-    private final int window_width;
-    private final int window_height;
+    // Updated from the GLFW framebuffer-size callback when the user resizes the window.
+    private volatile int window_width;
+    private volatile int window_height;
     private final int camera_size;
 
     private WindowPos windowPos;
@@ -35,9 +36,10 @@ public class WindowManager {
     // Avoids re-clearing + swapping the window every tick while it is already black.
     private boolean isBlack = false;
 
-    // The last yaw the window was drawn with; lets renderShader skip a full context switch + redraw
-    // when nothing has changed (view held still, no new face data, no screenshot pending).
+    // The last yaw / pitch the window was drawn with; lets renderShader skip a full context switch +
+    // redraw when nothing has changed (view held still, no new face data, no screenshot pending).
     private float lastYaw = Float.NaN;
+    private float lastPitch = Float.NaN;
 
     // Set by requestCapture(...); the next shader render writes the panorama window to this file.
     private volatile Path pendingCapture;
@@ -86,8 +88,8 @@ public class WindowManager {
         glfwDefaultWindowHints();
         // Show the window as soon as it is created.
         glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
-        // The panorama window has a fixed size.
-        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+        // Let the user resize the panorama window (the shader pass just re-fits to the framebuffer).
+        glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
         // Borderless or not, depending on the config.
         glfwWindowHint(GLFW_DECORATED, CONFIG.isBorderless() ? GLFW_FALSE : GLFW_TRUE);
 
@@ -126,6 +128,22 @@ public class WindowManager {
                 double dx = currentPos.x - cursorPos.x;
                 double dy = currentPos.y - cursorPos.y;
                 glfwSetWindowPos(window, windowPos.x + (int) dx, windowPos.y + (int) dy);
+            }
+        });
+
+        // Track the framebuffer size so the shader pass fills the whole window after a resize.
+        // (Framebuffer pixels, not screen coordinates - they differ on hi-DPI displays.)
+        int[] fbWidth = new int[1];
+        int[] fbHeight = new int[1];
+        glfwGetFramebufferSize(window, fbWidth, fbHeight);
+        window_width = fbWidth[0];
+        window_height = fbHeight[0];
+        glfwSetFramebufferSizeCallback(window, (win, w, h) -> {
+            if (w > 0 && h > 0) {
+                window_width = w;
+                window_height = h;
+                // Force the next renderShader to actually redraw at the new size.
+                lastYaw = Float.NaN;
             }
         });
 
@@ -185,6 +203,7 @@ public class WindowManager {
             }
         }
         uYawLocation = glGetUniformLocation(program, "uYaw");
+        uPitchLocation = glGetUniformLocation(program, "uPitch");
         glUseProgram(0);
 
         // Hand the context back to Minecraft.
@@ -197,6 +216,7 @@ public class WindowManager {
     private final int VAO;
     private final ShaderManager shaderManager;
     private final int uYawLocation;
+    private final int uPitchLocation;
 
     // Sampler uniform -> texture unit. Index matches the cube face order produced by PanoramaManager:
     // 0=front(N), 1=right(E), 2=back(S), 3=left(W), 4=top, 5=bottom.
@@ -222,16 +242,19 @@ public class WindowManager {
     /**
      * Redraws the panorama window.
      *
-     * @param buffers   the six CPU face buffers
-     * @param yawRadians horizontal view rotation (0 = "front"/north face centred)
-     * @param dirtyMask  bit {@code i} set => face {@code i} has new pixels to upload
+     * @param buffers     the six CPU face buffers
+     * @param yawRadians   horizontal view rotation (0 = "front"/north face centred)
+     * @param pitchRadians vertical view rotation (0 = horizon level)
+     * @param dirtyMask    bit {@code i} set => face {@code i} has new pixels to upload
      */
-    public void renderShader(ByteBuffer[] buffers, float yawRadians, int dirtyMask) {
+    public void renderShader(ByteBuffer[] buffers, float yawRadians, float pitchRadians, int dirtyMask) {
         boolean changed = dirtyMask != 0
                 || pendingCapture != null
                 || isBlack
                 || Float.isNaN(lastYaw)
+                || Float.isNaN(lastPitch)
                 || Math.abs(yawRadians - lastYaw) > 1.0e-4f
+                || Math.abs(pitchRadians - lastPitch) > 1.0e-4f
                 || isDragging;
         if (!changed) return;
 
@@ -244,6 +267,9 @@ public class WindowManager {
             glUseProgram(shaderManager.getShaderProgram());
             if (uYawLocation >= 0) {
                 glUniform1f(uYawLocation, yawRadians);
+            }
+            if (uPitchLocation >= 0) {
+                glUniform1f(uPitchLocation, pitchRadians);
             }
 
             uploadFaces(buffers, dirtyMask);
@@ -260,6 +286,7 @@ public class WindowManager {
             glfwSwapBuffers(window);
             isBlack = false;
             lastYaw = yawRadians;
+            lastPitch = pitchRadians;
         } finally {
             releaseContext();
         }
@@ -303,6 +330,7 @@ public class WindowManager {
             runBlack();
             isBlack = true;
             lastYaw = Float.NaN;
+            lastPitch = Float.NaN;
         } finally {
             releaseContext();
         }

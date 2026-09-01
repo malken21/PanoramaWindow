@@ -26,7 +26,8 @@ import java.nio.file.Path;
  * </ul>
  *
  * <p>Finally it asserts that the panorama images contain a rendered scene (not blank), change when
- * the camera rotates and when the player moves, and clearly differ between dimensions.
+ * the camera turns, when the player looks up and when the player moves, and clearly differ between
+ * dimensions.
  */
 public class PanoramaClientGameTest implements FabricClientGameTest {
 
@@ -60,6 +61,15 @@ public class PanoramaClientGameTest implements FabricClientGameTest {
             context.waitTicks(20);
             captures = assertKeptCapturing(captures, "after rotating the camera");
             savePanorama(context, "02-overworld-rot135.png");
+
+            // ---- Overworld: look up (pitch follows the player, no re-render) ----
+            faceNorth(context);
+            context.waitTicks(10);
+            savePanorama(context, "02a-overworld-level.png");
+            context.runOnClient(client -> client.player.setXRot(-70.0F));
+            context.waitTicks(20);
+            captures = assertKeptCapturing(captures, "after looking up");
+            savePanorama(context, "02b-overworld-lookup.png");
 
             // ---- Overworld: walk towards the north pillar ----
             faceNorth(context);
@@ -109,6 +119,7 @@ public class PanoramaClientGameTest implements FabricClientGameTest {
             assertHasContent("07-overworld-return.png");
 
             assertDiffers("01-overworld-north.png", "02-overworld-rot135.png", "rotating the camera");
+            assertDiffers("02a-overworld-level.png", "02b-overworld-lookup.png", "looking up");
             assertDiffers("03-overworld-before-walk.png", "04-overworld-after-walk.png", "walking");
             assertDiffers("04-overworld-after-walk.png", "05-nether.png", "travelling to the Nether");
             assertDiffers("05-nether.png", "06-end.png", "travelling to the End");

@@ -14,19 +14,29 @@ uniform sampler2D texLeft;
 uniform sampler2D texBottom;
 uniform sampler2D texTop;
 
-// Horizontal view rotation in radians. 0 puts the "front" (north) face at the window centre.
+// View rotation in radians, tracking the player. uYaw = 0 puts the "front" (north) face at the
+// window centre; uPitch = 0 keeps the horizon level. Turning the view is just these two rotations
+// applied here per frame instead of moving the cameras / re-rendering the world.
 uniform float uYaw;
+uniform float uPitch;
 
 out vec4 FragColor;
 
 // Equirectangular pixel -> unit direction in the world-aligned cube frame.
 vec3 genSphereVector() {
     vec2 source = -vec2(PI) + TexCoord * (2.0 * PI);
-    // Turn the view by rotating the sampled longitude rather than moving the cameras.
-    source.x += uYaw;
     float lat = source.y * 0.5;               // -PI/2 .. PI/2
     float cosLat = cos(lat);
-    return vec3(cosLat * sin(source.x), sin(lat), cosLat * cos(source.x));
+    vec3 d = vec3(cosLat * sin(source.x), sin(lat), cosLat * cos(source.x));
+
+    // Pitch about the view's right axis (X), then yaw about world up (Y). Doing pitch first keeps
+    // it an FPS-style look (up stays up) rather than tilting the horizon as the view turns.
+    float cp = cos(uPitch), sp = sin(uPitch);
+    d = vec3(d.x, d.y * cp - d.z * sp, d.y * sp + d.z * cp);
+
+    float cy = cos(uYaw), sy = sin(uYaw);
+    d = vec3(d.x * cy + d.z * sy, d.y, -d.x * sy + d.z * cy);
+    return d;
 }
 
 void main() {
