@@ -38,8 +38,10 @@ back through the Blaze3D GPU abstraction one frame later and each face is upload
 window's textures only when it actually changes.
 
 The capture resolution is not a setting - it is derived from the window size (about a quarter
-of the width, capped at 2048 px per face) so it always matches how big the window is. Resize
-the window and the next full sweep re-captures at the new resolution.
+of the width per face) so it always matches how big the window is. Resize the window and the
+next full sweep re-captures at the new resolution. The per-face resolution is capped at the
+GPU's maximum texture size (and 8192 px); an 8K window (~3240 px/face wanted) is captured at
+full resolution on any GPU that reports an 8192+ limit.
 
 ## Notes on the 26.2 port
 

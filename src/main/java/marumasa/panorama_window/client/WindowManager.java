@@ -34,6 +34,9 @@ public class WindowManager {
     // then the resized pixels flow in and uploadFaces() grows/shrinks each GL texture to fit.
     private volatile int faceSize;
     private final int[] texSize = new int[6];
+    // Upper bound for faceSize: what the GPU can allocate, hard-capped for VRAM sanity. Large
+    // enough that an 8K window (~2160 px/face wanted) captures at full resolution.
+    private final int maxFaceSize;
 
     private WindowPos windowPos;
     private CursorPos cursorPos;
@@ -77,15 +80,16 @@ public class WindowManager {
     }
 
     /** Cube-face capture resolution that keeps up with a panorama window this big (px). */
-    static int faceSizeFor(int windowWidth, int windowHeight) {
+    static int faceSizeFor(int windowWidth, int windowHeight, int maxFaceSize) {
         // The window shows the full 360x180 equirectangular field: 360 deg across the width, 180 deg
         // down the height. A cube face spans 90 deg, so to roughly match the window's angular pixel
         // density a face needs about width/4 (and height/2) pixels; * 1.5 for headroom, since the
-        // gnomonic face projection undersamples toward its edges.
+        // gnomonic face projection undersamples toward its edges. At 8K (7680x4320) that asks for
+        // ~3240 px/face; the cap is the GPU's max texture size (clamped to 8192).
         int ideal = (int) Math.ceil(1.5 * Math.max(windowWidth / 4.0, windowHeight / 2.0));
         int step = 128; // quantise so a slow resize drag doesn't reallocate textures every pixel
         int rounded = ((ideal + step - 1) / step) * step;
-        return Math.min(2048, Math.max(256, rounded));
+        return Math.min(maxFaceSize, Math.max(256, rounded));
     }
 
     public WindowManager(int width, int height, String title, Minecraft client) {
@@ -119,6 +123,10 @@ public class WindowManager {
         // Switch to the panorama context and build its GL capabilities.
         glfwMakeContextCurrent(window);
         this.panoramaCapabilities = GL.createCapabilities();
+        // How large a cube face this GPU will let us allocate (clamped so an absurd window size
+        // can't try to make a multi-gigabyte texture set). GL guarantees at least 1024.
+        int glMaxTexture = glGetInteger(GL_MAX_TEXTURE_SIZE);
+        this.maxFaceSize = Math.min(8192, glMaxTexture > 0 ? glMaxTexture : 2048);
         // Disable v-sync for the panorama window.
         glfwSwapInterval(0);
         // Paint it black to start with.
@@ -154,12 +162,12 @@ public class WindowManager {
         glfwGetFramebufferSize(window, fbWidth, fbHeight);
         window_width = fbWidth[0];
         window_height = fbHeight[0];
-        faceSize = faceSizeFor(window_width, window_height);
+        faceSize = faceSizeFor(window_width, window_height, maxFaceSize);
         glfwSetFramebufferSizeCallback(window, (win, w, h) -> {
             if (w > 0 && h > 0) {
                 window_width = w;
                 window_height = h;
-                faceSize = faceSizeFor(w, h);
+                faceSize = faceSizeFor(w, h, maxFaceSize);
                 // Force the next renderShader to actually redraw at the new size.
                 lastYaw = Float.NaN;
             }
