@@ -1,88 +1,59 @@
 plugins {
-    id 'net.fabricmc.fabric-loom' version "${loom_version}"
-    id 'maven-publish'
+    id 'xyz.wagyourtail.unimined' apply false
 }
 
-version = project.mod_version
-group = project.maven_group
-
-base {
-    archivesName = project.archives_base_name
+def targetTable = new groovy.json.JsonSlurper().parse(file('targets.json'))
+// 各ビルド対象に、世代 (era) ごとの設定を合わせたもの
+def panoramaOnly = (providers.gradleProperty('panoramaOnly').orNull ?: '').tokenize(',')
+ext.panoramaTargets = targetTable.targets.findAll {
+    panoramaOnly.isEmpty() || it.name in panoramaOnly
+}.collect { target ->
+    def era = targetTable.eras[target.era]
+    if (era == null) throw new GradleException("Unknown era '${target.era}' in targets.json")
+    [sources: era, fabricLoader: targetTable.fabricLoader] + target
 }
 
-repositories {
-    // Add repositories to retrieve artifacts from in here.
-    // You should only use this when depending on other mods because
-    // Loom adds the essential maven repositories to download Minecraft and libraries from automatically.
+allprojects {
+    version = rootProject.mod_version
+    group = rootProject.maven_group
 }
 
-dependencies {
-    // To change the versions see the gradle.properties file
-    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+subprojects {
+    plugins.withId('java') {
+        java {
+            toolchain {
+                languageVersion = JavaLanguageVersion.of(rootProject.compile_jdk as int)
+            }
+        }
 
-    // Minecraft 26.1+ ships unobfuscated, so Mojang's official mappings are used
-    // automatically by Loom and no explicit `mappings` dependency is required.
-    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
-
-    // Fabric API. This is technically optional, but you probably want it anyway.
-    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
-}
-
-processResources {
-    inputs.property "version", project.version
-    inputs.property "minecraft_version", project.minecraft_version
-    inputs.property "loader_version", project.loader_version
-    filteringCharset "UTF-8"
-
-    filesMatching("fabric.mod.json") {
-        expand "version": project.version,
-                "minecraft_version": project.minecraft_version,
-                "loader_version": project.loader_version
-    }
-}
-
-// Client game tests (./gradlew runClientGameTest) - smoke-tests the in-world panorama capture.
-fabricApi {
-    configureTests {
-        createSourceSet = true
-        modId = "panorama_window-test"
-        enableClientGameTests = true
-        eula = true
-    }
-}
-
-def targetJavaVersion = 25
-tasks.withType(JavaCompile).configureEach {
-    // ensure that the encoding is set to UTF-8, no matter what the system default is
-    it.options.encoding = "UTF-8"
-    it.options.release.set(targetJavaVersion)
-}
-
-java {
-    def javaVersion = JavaVersion.toVersion(targetJavaVersion)
-    if (JavaVersion.current() < javaVersion) {
-        toolchain.languageVersion = JavaLanguageVersion.of(targetJavaVersion)
-    }
-    // Loom will automatically attach sourcesJar to a RemapSourcesJar task and to the "build" task
-    // if it is present.
-    withSourcesJar()
-}
-
-jar {
-    from("LICENSE") {
-        rename { "${it}_${project.archives_base_name}" }
-    }
-}
-
-// configure the maven publication
-publishing {
-    publications {
-        create("mavenJava", MavenPublication) {
-            from components.java
+        tasks.withType(JavaCompile).configureEach {
+            options.encoding = 'UTF-8'
+            // Minecraft 1.14 - 1.16 は Java 8 で動くので、すべてのクラスを Java 8 形式 (major 52) で出力する
+            options.compilerArgs += ['-Xlint:-options']
         }
     }
+}
 
-    repositories {
-        // Add repositories to publish to here.
+// 対象ごとの jar を別のビルドで作ってある場合の、その置き場所。
+// 指定すると、対象の Minecraft の準備をせずに、置いてある jar から配布するファイルを組み立てる
+ext.panoramaPrebuilt = providers.gradleProperty('panoramaPrebuilt').map { file(it) }.orNull
+
+if (panoramaPrebuilt == null) {
+    panoramaTargets.each { target ->
+        project(":targets:${target.name}") {
+            ext.spec = target
+            apply from: rootProject.file('gradle/target.gradle')
+        }
+    }
+}
+
+// 対象ごとの jar を 1 か所に集める (別のビルドで panoramaPrebuilt として使う)。
+// 置き場所は build/prebuilt/<対象>.jar
+tasks.register('exportRemapped', Sync) {
+    into layout.buildDirectory.dir('prebuilt')
+    panoramaTargets.each { target ->
+        from(project(":targets:${target.name}").tasks.named('remapJar').flatMap { it.archiveFile }) {
+            rename { "${target.name}.jar" }
+        }
     }
 }

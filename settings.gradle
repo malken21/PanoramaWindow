@@ -1,12 +1,46 @@
 pluginManagement {
     repositories {
         maven {
+            name = 'wagyourtail releases'
+            url = 'https://maven.wagyourtail.xyz/releases'
+        }
+        maven {
+            name = 'wagyourtail snapshots'
+            url = 'https://maven.wagyourtail.xyz/snapshots'
+        }
+        maven {
             name = 'Fabric'
             url = 'https://maven.fabricmc.net/'
         }
         mavenCentral()
-        gradlePluginPortal()
+        gradlePluginPortal {
+            content {
+                excludeGroup('org.apache.logging.log4j')
+            }
+        }
+    }
+    plugins {
+        id 'xyz.wagyourtail.unimined' version "${unimined_version}"
     }
 }
 
-rootProject.name = 'panorama_window'
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '1.0.0'
+}
+
+rootProject.name = 'PanoramaWindow'
+
+include 'core'
+include 'dist'
+
+// targets.json の各項目が、Minecraft のバージョン 1 つ分のビルド対象。
+// 開発中は -PpanoramaOnly=mc1_16_5,mc26_2 のように対象を絞ると、設定にかかる時間を短くできる
+def panoramaOnly = (providers.gradleProperty('panoramaOnly').orNull ?: '').tokenize(',')
+new groovy.json.JsonSlurper().parse(file('targets.json')).targets.findAll {
+    panoramaOnly.isEmpty() || it.name in panoramaOnly
+}.each { target ->
+    include "targets:${target.name}"
+    def dir = file("targets/${target.name}")
+    dir.mkdirs()
+    project(":targets:${target.name}").projectDir = dir
+}

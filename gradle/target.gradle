@@ -1,0 +1,106 @@
+// targets.json の 1 項目 (Minecraft のバージョン 1 つ) をビルドするための共通設定。
+// ソースは adapters/ 以下にあり、世代 (era) で指定したフォルダを重ねて使う。
+// どの項目でもパッケージは marumasa.panorama_window.adapter で、統合 jar の中にバージョンごとの jar として入る
+// (Fabric Loader が、実行中の Minecraft のバージョンに合う 1 つだけを読み込む)。
+
+apply plugin: 'java'
+apply plugin: 'xyz.wagyourtail.unimined'
+
+def spec = project.ext.spec
+def sourceDirs = { String kind ->
+    spec.sources.collect { rootProject.file("adapters/${it}/${kind}") }
+}
+
+sourceSets {
+    main {
+        java.srcDirs = sourceDirs('java')
+        resources.srcDirs = sourceDirs('resources')
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    sourceCompatibility = '8'
+    targetCompatibility = '8'
+}
+
+unimined.minecraft {
+    version spec.minecraft
+
+    mappings {
+        switch (spec.mappings) {
+            case 'mojmap':
+                mojmap()
+                break
+            case 'none':
+                // 26.1 以降は難読化されていないため不要
+                break
+            default:
+                throw new GradleException("Unknown mappings: ${spec.mappings}")
+        }
+    }
+
+    fabric {
+        loader spec.fabricLoader
+    }
+
+    defaultRemapJar = true
+}
+
+// Mixin の注釈に書いた名前を、refmap を使わずに実行時の名前 (intermediary) へ直接書き換える
+tasks.named('remapJar') {
+    mixinRemap {
+        enableBaseMixin()
+        enableMixinExtra()
+        disableRefmap()
+    }
+}
+
+dependencies {
+    implementation project(':core')
+}
+
+// Mixin の設定とバージョンごとの Fabric 用メタデータ。統合 jar の中に入れ子で入り、対応するバージョンのときだけ読み込まれる。
+// ビルドツールが設定時にこのファイルを読むため、タスクではなくその場で書き出す
+def mixinPackage = 'marumasa.panorama_window.adapter.mixin'
+def mixinConfig = 'panorama_window_adapter.mixins.json'
+def mixins = sourceDirs('java').collectMany { dir ->
+    def pkgDir = new File(dir, mixinPackage.replace('.', '/'))
+    pkgDir.isDirectory() ? pkgDir.listFiles().findAll { it.name.endsWith('.java') }.collect { it.name - '.java' } : []
+}.unique().sort()
+
+def versions = spec.versions
+def label = versions.size() == 1 ? versions[0] : "${versions.first()} - ${versions.last()}"
+def metadataDir = layout.buildDirectory.dir('generated/fabric-resources').get().asFile
+def writeIfChanged = { String name, String text ->
+    def file = new File(metadataDir, name)
+    if (!file.exists() || file.getText('UTF-8') != text) {
+        metadataDir.mkdirs()
+        file.setText(text, 'UTF-8')
+    }
+}
+writeIfChanged('fabric.mod.json', groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson([
+        schemaVersion: 1,
+        id           : "panorama_window_${spec.name}".toString(),
+        version      : project.version.toString(),
+        name         : "PanoramaWindow (${label})".toString(),
+        description  : "PanoramaWindow for Minecraft ${label}.".toString(),
+        license      : 'MIT',
+        environment  : 'client',
+        entrypoints  : [client: ['marumasa.panorama_window.adapter.FabricEntry']],
+        mixins       : [mixinConfig],
+        depends      : [panorama_window: '*', minecraft: versions],
+        custom       : [modmenu: [parent: 'panorama_window', badges: ['library']]],
+])) + '\n')
+writeIfChanged(mixinConfig, groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson([
+        required          : true,
+        minVersion        : '0.8',
+        package           : mixinPackage,
+        compatibilityLevel: 'JAVA_8',
+        client            : mixins,
+        injectors         : [defaultRequire: 1],
+])) + '\n')
+sourceSets.main.resources.srcDir(metadataDir)

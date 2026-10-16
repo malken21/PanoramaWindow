@@ -1,0 +1,61 @@
+plugins {
+    id 'java-library'
+}
+
+repositories {
+    mavenCentral()
+}
+
+// LWJGL 3.3 以降 (Minecraft 1.19 以降) でだけ使う部分 (libffi)。LWJGL 3.3 の API でコンパイルする
+sourceSets {
+    ffi33 {
+        compileClasspath += sourceSets.main.output
+    }
+    // Minecraft 26.3 以降 (GLFW の代わりに SDL3) でだけ使う部分
+    sdl {
+        compileClasspath += sourceSets.main.output
+    }
+}
+
+// Minecraft に依存しない共通の処理。どのバージョンの Minecraft にも同梱されているライブラリの、
+// 最も古い版 (1.14 のもの) にある API だけを使う
+dependencies {
+    compileOnly 'org.lwjgl:lwjgl:3.2.1'
+    compileOnly 'org.lwjgl:lwjgl-glfw:3.2.1'
+    compileOnly 'org.lwjgl:lwjgl-opengl:3.2.1'
+    compileOnly 'com.google.code.gson:gson:2.8.0'
+    compileOnly 'org.apache.logging.log4j:log4j-api:2.8.1'
+
+    ffi33CompileOnly 'org.lwjgl:lwjgl:3.3.1'
+    sdlCompileOnly 'org.lwjgl:lwjgl:3.4.3'
+    sdlCompileOnly 'org.lwjgl:lwjgl-sdl:3.4.3'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    // Minecraft 1.14 - 1.16 は Java 8 で動くので、JDK 8 の API だけに制限する
+    options.release = 8
+}
+
+// 配布する jar に入れるもの (main と ffi33 と sdl)
+ext.distOutputs = [sourceSets.main.output, sourceSets.ffi33.output, sourceSets.sdl.output]
+
+// Spout2 の送信を、Minecraft を起動せずに確かめる。-PspoutLwjgl=3.2.2 で LWJGL 3.2 (dyncall) の側も確かめられる
+def spoutLwjgl = providers.gradleProperty('spoutLwjgl').getOrElse('3.3.3')
+configurations {
+    spoutCheckRuntime
+}
+dependencies {
+    testCompileOnly 'org.lwjgl:lwjgl:3.2.1'
+    testCompileOnly 'org.lwjgl:lwjgl-glfw:3.2.1'
+    testCompileOnly 'org.lwjgl:lwjgl-opengl:3.2.1'
+    spoutCheckRuntime 'org.apache.logging.log4j:log4j-api:2.8.1'
+    ['lwjgl', 'lwjgl-glfw', 'lwjgl-opengl'].each {
+        spoutCheckRuntime "org.lwjgl:${it}:${spoutLwjgl}"
+        spoutCheckRuntime "org.lwjgl:${it}:${spoutLwjgl}:natives-windows"
+    }
+}
+tasks.register('spoutCheck', JavaExec) {
+    classpath = sourceSets.test.output + sourceSets.main.output + sourceSets.ffi33.output + configurations.spoutCheckRuntime
+    mainClass = 'marumasa.panorama_window.core.spout.SpoutCheck'
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(21) }
+}

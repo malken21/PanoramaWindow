@@ -1,30 +1,68 @@
 # Development
 
-## Notes on the 26.2 port
+The build layout follows [MarumaSign](https://github.com/TORO-Server/MarumaSign): every supported
+Minecraft version range is a separate build target, and all of them are packed into one jar.
 
-Minecraft 26.1+ ships unobfuscated, so the mod now builds against Mojang's official mappings instead of Yarn.
+## Layout
+
+| Folder | Contents |
+| --- | --- |
+| `core` | Everything that does not touch Minecraft: capture scheduling, the panorama window (GLFW / SDL3), the GL face copy, the settings UI toolkit (ported from MarumaSign), Spout2, config, translations. Compiled for Java 8 against the oldest bundled libraries (LWJGL 3.2.1, Gson 2.8.0). Two extra source sets hold code that needs newer LWJGL APIs and is only loaded when they exist: `ffi33` (libffi, LWJGL 3.3+) and `sdl` (SDL3, Minecraft 26.3+). |
+| `adapters` | Minecraft-version-specific code, in small layers. `targets.json` lists, per era, which layers are stacked. All layers use the package `marumasa.panorama_window.adapter`. |
+| `dist` | Builds `PanoramaWindow-<version>.jar`: `core` plus one nested jar per target (Fabric's jar-in-jar picks the one whose `minecraft` dependency matches). |
+| `tools` | Linkage check, real-client verification, UI layer generator. |
+
+Adapter layers:
+
+| Layer | Purpose |
+| --- | --- |
+| `common` | Fabric entry point, `MinecraftMixin` (tick / frame / stop hooks), `GameImpl`, settings key handling. |
+| `v*` | `Mc`: how to render a level, resize the render target, read the colour texture, ... for that era. |
+| `fov_*` | FOV override mixin (`getFov` returning `double` / `float`, or `Camera.calculateFov`). |
+| `acc_1_14` | Accessors for fields that have no setters before 1.17. |
+| `bb_*`, `camera_*`, `nametag_*` | Billboard / name-tag mixins (see [How it works](how-it-works.md#billboards)). |
+| `sdl_events` | 26.3+: keep SDL window events of the panorama window away from Minecraft. |
+| `ui_*` | Settings screen: texture upload + screen drawing per era. Generated from MarumaSign by `python tools/gen_ui_adapters.py` (the output is committed). |
+
+Mixin annotations are remapped straight into the bytecode (`mixinRemap { disableRefmap() }`), so the
+nested jars need no refmap.
 
 ## Building
 
 ```bash
-./gradlew build
+./gradlew :dist:assemble
 ```
 
-## Testing
-
-An automated in-world test is available:
+The jar is written to `dist/build/libs`. The first build downloads and remaps every supported
+Minecraft version, which takes a while. To iterate on a few targets only:
 
 ```bash
-./gradlew runClientGameTest
+./gradlew -PpanoramaOnly=mc1_16_5,mc26_2 :dist:assemble
 ```
 
-It builds a ring of coloured landmark pillars, then rotates the camera, walks, and travels Overworld -> Nether -> End -> Overworld while checking that:
+## Checks
 
-- The face capture keeps completing without crashing or stalling (including across dimension changes, and while switching the GL context every frame)
-- The panorama window actually contains a rendered scene (not blank)
-- The panorama changes when the camera turns, when the player looks up, when the player moves, and between dimensions
-- A named armour stand on a cube-face boundary keeps rendering (its name tag exercises the billboard mixins during capture)
-- The player actually lands where the test teleported it (a fall-through would invalidate the captured scene)
+```bash
+# Every nested jar against every Minecraft version it claims to support (no game launch):
+# referenced classes / methods / fields and mixin targets must exist in that exact version.
+python tools/check_linkage.py
 
-The rendered panorama frames are written to `build/run/clientGameTest/panorama-test-output/`.
+# Spout2 sender + a Java receiver, without Minecraft (LWJGL 3.3 / libffi by default)
+./gradlew :core:spoutCheck
+./gradlew :core:spoutCheck -PspoutLwjgl=3.2.2   # LWJGL 3.2 / dyncall path
 
+# Real clients: starts a vanilla server, joins with Fabric + the mod, and runs the built-in self test
+python tools/verify/matrix.py                    # representative version of every era
+python tools/verify/matrix.py 1.20.1 26.3        # chosen versions
+python tools/verify/matrix.py --shaders          # with Iris + a shader pack (BSL by default)
+python tools/verify/matrix.py --shaders --shader-pack complementary-reimagined 1.21.1
+python tools/verify/matrix.py --option 'preferredGraphicsBackend:"vulkan"' 26.2   # Vulkan backend
+```
+
+The self test (`-Dpanorama_window.selftest=<dir>`) waits for several full sweeps, saves the panorama
+window, turns 90° and looks up (saving each time), opens the settings screen (the script captures the
+Minecraft window), turns Spout2 on and checks that the sender is registered, then quits. The script
+checks that the images contain a scene and change with the view, that the settings screen is
+visible, and that the log has no mod-related warnings or mixin failures. Results go to
+`build/verify-summary.json`; runs share the client / server cache with MarumaSign's checks
+(`~/.marumasign-verify`).

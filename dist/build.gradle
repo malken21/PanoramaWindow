@@ -1,0 +1,76 @@
+plugins {
+    id 'base'
+}
+
+base {
+    archivesName = 'PanoramaWindow'
+}
+
+def targets = rootProject.panoramaTargets
+def prebuilt = rootProject.panoramaPrebuilt
+if (prebuilt == null) {
+    targets.each { evaluationDependsOn(":targets:${it.name}") }
+}
+evaluationDependsOn(':core')
+
+// 対象ごとの jar。panoramaPrebuilt を指定したときは、そこに置いてあるものを使う
+def remappedJar = { target ->
+    if (prebuilt != null) {
+        def jar = new File(prebuilt, "${target.name}.jar")
+        if (!jar.isFile()) throw new GradleException("Prebuilt jar is missing: ${jar}")
+        return layout.file(providers.provider { jar })
+    }
+    return project(":targets:${target.name}").tasks.named('remapJar').flatMap { it.archiveFile }
+}
+
+// Fabric は jar の中の jar を扱えるので、バージョンごとの実装をそのまま同梱し、
+// 実行中のバージョンに合うものだけを Fabric Loader に選ばせる
+def nestedJars = [:]
+targets.each { target ->
+    nestedJars["panorama_window-${target.name}.jar".toString()] = remappedJar(target)
+}
+
+def generateFabricMetadata = tasks.register('generateFabricMetadata') {
+    def outputDir = layout.buildDirectory.dir('generated/fabric')
+    def json = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson([
+            schemaVersion: 1,
+            id           : 'panorama_window',
+            version      : project.version.toString(),
+            name         : 'PanoramaWindow',
+            description  : 'Real-time 360 degree panorama rendered into a separate window.',
+            authors      : ['malken21'],
+            contact      : [repo: 'https://github.com/malken21/PanoramaWindow'],
+            license      : 'MIT',
+            environment  : 'client',
+            jars         : nestedJars.keySet().sort().collect { [file: "META-INF/jars/${it}".toString()] },
+            // MixinExtras (WrapOperation) は Fabric Loader 0.15 から同梱されている
+            depends      : [fabricloader: '>=0.15.0', minecraft: '>=1.14'],
+    ]))
+    inputs.property('json', json)
+    outputs.dir(outputDir)
+    doLast {
+        def file = new File(outputDir.get().asFile, 'fabric.mod.json')
+        file.parentFile.mkdirs()
+        file.setText(json + '\n', 'UTF-8')
+    }
+}
+
+def universalJar = tasks.register('universalJar', Jar) {
+    archiveVersion = project.version.toString()
+    destinationDirectory = layout.buildDirectory.dir('libs')
+    duplicatesStrategy = DuplicatesStrategy.FAIL
+
+    project(':core').distOutputs.each { from(it) }
+    from(generateFabricMetadata)
+    nestedJars.each { name, jar ->
+        from(jar) {
+            into 'META-INF/jars'
+            rename { name }
+        }
+    }
+    from(rootProject.file('LICENSE')) {
+        rename { "${it}_panorama_window" }
+    }
+}
+
+assemble.dependsOn(universalJar)
