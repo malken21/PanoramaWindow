@@ -59,7 +59,11 @@ pack is active, three things are handled specially:
   and only the centre is kept, so every face has context beyond its edge and the rays line up
   across seams. `Overscan = 0` (automatic) means 1.5× (≈ 113°) while a shader pack is active and
   1.0× otherwise. A pack that disables its rays entirely when the sun is behind the camera will
-  still show no rays on that face - that is the pack's choice.
+  still show no rays on that face - that is the pack's choice. 1.5× is not always enough: when the
+  sun is near a cube corner, a neighbouring face may still not see it, and a faint edge remains until
+  about 2.0× ([comparison](verification.md#overscan-and-screen-space-god-rays)); each step up costs
+  face resolution (the face is `window height / Overscan` pixels in `crop` mode). Screen-space
+  **lens flares** cannot be fixed this way - every face draws them at its own mirrored position.
 
 Shader-pack detection is reflective and needs no dependency (`ShaderMods`):
 
@@ -68,6 +72,11 @@ Shader-pack detection is reflective and needs no dependency (`ShaderMods`):
 | Iris (or anything exposing Iris's API) | `IrisApi.getInstance().isShaderPackInUse()` returns true |
 | OptiFine (through OptiFabric) | `net.optifine.Config.isShaders()` returns true |
 | Canvas | `grondag.canvas.CanvasMod` is present (always) |
+
+The hand is normally hidden with `GameRenderer.setRenderHand(false)`. OptiFine's shader pipeline draws
+the hand itself in the middle of the world pass (`ShadersRender.renderHand0`) without looking at that
+flag, so on 1.16 - 1.20.4 (where OptiFabric exists) `ItemInHandRenderer.renderHandsWithItems` is also
+skipped while a face is being rendered.
 
 Which of these have actually been tried on a real client is listed under
 [Compatibility](../README.md#compatibility).

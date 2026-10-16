@@ -3,7 +3,8 @@
 ローダーと Minecraft のバージョンに合う影 Mod と、それが必要とする Mod、シェーダーパックを取得して、
 起動フォルダに置き、シェーダーを有効にする設定を書く。
 
-- Fabric: Iris (と Sodium)
+- Fabric: Iris (と Sodium)。shader_mod に "optifine" を指定すると OptiFabric + OptiFine (1.16 - 1.20.4)、
+  "canvas" を指定すると Canvas (1.17.1 - 1.20.2。シェーダーパックではなく、Canvas 自身の描画パイプラインを使う)
 - NeoForge: Iris (と Sodium)
 - Forge 1.16.5 以降: Oculus (と Rubidium / Embeddium)
 - Forge 1.7.10 - 1.15.2: OptiFine
@@ -21,16 +22,24 @@ from pathlib import Path
 MODRINTH = "https://api.modrinth.com/v2"
 # OptiFine は公式サイトから機械的には取得できないため、ランチャーが使っているミラーから取得する
 OPTIFINE = "https://bmclapi2.bangbang93.com/optifine"
+# OptiFabric は CurseForge にしかない。CurseForge のサイトが使っている API (キーが要らない) で一覧を取る
+CURSEFORGE = "https://www.curseforge.com/api/v1/mods"
+OPTIFABRIC_PROJECT = 322385
 USER_AGENT = "PanoramaWindow-verify/1.0 (local testing)"
 
 # シェーダーパック。古い OptiFine から新しい Iris まで、幅広いバージョンで動くもの
 SHADER_PACK = "bsl-shaders"
+
+# 1 つの版に品質違いのファイルが並ぶパックで、使うファイル (名前の終わり)。
+# Sildur's Vibrant の Extreme は画面上の太陽の位置から光の筋 (god rays) を描く (Extreme-VL は立体的な光で、画面に依らない)
+PACK_FILES = {"sildurs-vibrant-shaders": " Extreme.zip"}
 
 # シェーダーが有効になったことを示すログの行
 ACTIVE_PATTERNS = [
     re.compile(r"Using shaderpack: "),               # Iris / Oculus
     re.compile(r"\[Shaders\] Loaded shaderpack: "),  # OptiFine
     re.compile(r"Loaded shaderpack: "),
+    re.compile(r"Canvas Renderer is initializing"),  # Canvas (常に独自の描画パイプライン)
 ]
 
 
@@ -191,6 +200,24 @@ def optifine_file(minecraft):
     return entry["filename"], f"{OPTIFINE}/{minecraft}/{entry['type']}/{entry['patch']}"
 
 
+def optifabric_file(minecraft, cache_dir):
+    """このバージョンに対応する、最も新しい OptiFabric。なければ None。
+    CurseForge の対応バージョンの表記は抜けていることがある (1.14.3 は 1.16.5 にも対応しているのに 1.19 以降だけ) ので、
+    jar の中の fabric.mod.json で判定する。1.16.5 で 1.13.16 を使うと、OptiFine を読み込まないまま起動してしまう
+    (Fabric Loader 0.15.11 で確認)"""
+    files = fetch_json(f"{CURSEFORGE}/{OPTIFABRIC_PROJECT}/files?pageIndex=0&pageSize=50"
+                       "&sort=dateCreated&sortDescending=true").get("data", [])
+    for entry in files[:10]:
+        file_id, name = entry["id"], entry["fileName"]
+        url = f"https://mediafilez.forgecdn.net/files/{file_id // 1000}/{file_id % 1000}/{name}"
+        download(url, cache_dir / name)
+        with zipfile.ZipFile(cache_dir / name) as archive:
+            wanted = json.loads(archive.read("fabric.mod.json").decode("utf-8")).get("depends", {}).get("minecraft", [])
+        if minecraft in (wanted if isinstance(wanted, list) else [wanted]):
+            return name, url
+    return None
+
+
 def pack_version(pack, loader, minecraft):
     """シェーダーパックの、指定したバージョン向けの最新版。その表記がなければ、パックの最新版。"""
     version = modrinth_version(pack, loader, minecraft)
@@ -200,6 +227,15 @@ def pack_version(pack, loader, minecraft):
         versions = fetch_json(f"{MODRINTH}/project/{pack}/version?{query}")
         releases = [item for item in versions if item.get("version_type") == "release"]
         version = (releases or versions or [None])[0]
+    if version is not None and pack in PACK_FILES:
+        # 品質違いのファイルが別の版として並んでいるので、同じ版番号の中から使うファイルを探す
+        query = urllib.parse.urlencode({"loaders": json.dumps([loader])})
+        for item in fetch_json(f"{MODRINTH}/project/{pack}/version?{query}"):
+            if item.get("version_number") != version.get("version_number"):
+                continue
+            wanted = [file for file in item["files"] if file["filename"].endswith(PACK_FILES[pack])]
+            if wanted:
+                return dict(item, files=wanted)
     return version
 
 
@@ -212,15 +248,34 @@ def variant(pack_slug=None, shader_mod=None):
 def resolve(loader, minecraft, cache_dir, pack_slug=SHADER_PACK, shader_mod=None):
     """影 Mod の構成を返す。この組み合わせで使える影 Mod がなければ None。
 
-    shader_mod に "optifine" を指定すると、Forge 1.16.5 以降でも OptiFine を使う。
+    shader_mod に "optifine" を指定すると、Forge 1.16.5 以降でも OptiFine を、Fabric では OptiFabric + OptiFine を使う。
+    "canvas" を指定すると、Fabric で Canvas を使う (シェーダーパックは使わないので pack は None)。
 
     戻り値: {"name": 影 Mod の名前, "mods": [(ファイル名, URL)], "config": 設定ファイルの名前, "pack": (ファイル名, URL)}
     """
     library = None
     try:
-        if shader_mod == "optifine" and loader not in ("forge", "liteloader"):
+        if shader_mod == "optifine" and loader not in ("forge", "liteloader", "fabric"):
             return None
-        if loader in ("fabric", "neoforge"):
+        if shader_mod == "canvas":
+            if loader != "fabric":
+                return None
+            version = modrinth_version("canvas", loader, minecraft)
+            if version is None:
+                return None
+            primary = next((file for file in version["files"] if file.get("primary")), version["files"][0])
+            # シェーダーパックの代わりに、Canvas に入っている描画パイプラインの名前 (canvas_basic / canvas_standard) を指定できる
+            pipeline = pack_slug if pack_slug and pack_slug.startswith("canvas_") else None
+            return {"name": "Canvas", "mods": [(primary["filename"], primary["url"])], "config": "config/canvas.json5",
+                    "pack_slug": pipeline, "library": None, "pack": None, "pipeline": pipeline}
+        if loader == "fabric" and shader_mod == "optifine":
+            # OptiFabric が mods フォルダの OptiFine を読み込む。OptiFabric の版ごとに対応する OptiFine は決まっていて、
+            # 各 Minecraft の最後の OptiFine に合わせてある
+            optifabric = optifabric_file(minecraft, cache_dir)
+            optifine = optifine_file(minecraft)
+            mods = [optifabric, optifine] if optifabric and optifine else None
+            name, config = "OptiFine", "optionsshaders.txt"
+        elif loader in ("fabric", "neoforge"):
             mods = modrinth_files("iris", loader, minecraft, {"iris"}, cache_dir)
             name, config = "Iris", "config/iris.properties"
         elif loader == "forge" and version_key(minecraft) >= (1, 16, 5) and shader_mod != "optifine":
@@ -257,6 +312,13 @@ def install(setup, cache_dir, work_dir):
         cached = cache_dir / filename
         download(url, cached)
         shutil.copy2(cached, work_dir / "mods" / filename)
+    if setup["pack"] is None:
+        if setup.get("pipeline"):
+            # 足りない項目は Canvas が既定の値で補う
+            config = work_dir / setup["config"]
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text(f'{{\n\t"pipelineId": "canvas:pipelines/{setup["pipeline"]}.json5"\n}}\n')
+        return
     pack_name, pack_url = setup["pack"]
     cached = cache_dir / pack_name
     download(pack_url, cached)
@@ -289,4 +351,4 @@ if __name__ == "__main__":
             print(f"{item}: no shader mod")
         else:
             print(f"{item}: {result['name']} {[name for name, _ in result['mods']] or result['library'].name}"
-                  f" + {result['pack'][0]}")
+                  f" + {result['pack'][0] if result['pack'] else '(no pack)'}")

@@ -31,8 +31,8 @@ How the capture, the shader-mod handling and Spout2 work is described in
 | --- | --- |
 | Vanilla (OpenGL, and the Vulkan backend of 26.2+) | Tested on real clients - which versions: [Verification results](docs/verification.md). |
 | Iris + shader packs | Tested on real clients - which versions and packs: [Verification results](docs/verification.md). |
-| OptiFine (through OptiFabric) | Detected, but **not tested on a real client**. |
-| Canvas | Detected, but **not tested on a real client**. |
+| OptiFine (through OptiFabric) | Tested on real clients (1.16.5, 1.20.1). OptiFabric 1.14.3 hung at start-up on Fabric Loader 0.20.0 and works on 0.15.11 - use an older Loader with it. |
+| Canvas | Tested on real clients (1.18.2, 1.20.1; `canvas_basic` and `canvas_standard` pipelines). Canvas exists for 1.17.1 - 1.20.2 only. |
 
 "Detected" means the mod recognises the shader mod and switches to its shader-pack behaviour
 ([details](docs/how-it-works.md#shader-mods)).
@@ -41,6 +41,9 @@ How the capture, the shader-mod handling and Spout2 work is described in
 
 - **Particles in 1.14 - 1.21.8** are not turned to a common direction while capturing, so a particle
   on a cube-face boundary can tear along the seam ([why](docs/how-it-works.md#billboards)).
+- **Screen-space lens flares** of shader packs appear once per face, as ghost blobs in odd places.
+  Turn them off in the pack's settings. God rays and sun glow need `Overscan` to stay continuous
+  across seams ([details](docs/how-it-works.md#shader-mods)).
 
 ## Settings
 

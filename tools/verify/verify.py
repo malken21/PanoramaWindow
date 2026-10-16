@@ -89,8 +89,9 @@ def find_java(major, main_dir):
 # ---------- サーバー ----------
 
 class Server:
-    def __init__(self, minecraft, root, main_dir, port):
+    def __init__(self, minecraft, root, main_dir, port, time_of_day="noon"):
         self.minecraft = minecraft
+        self.time_of_day = time_of_day
         self.directory = root / "servers" / minecraft
         self.main_dir = main_dir
         self.port = port
@@ -168,7 +169,12 @@ class Server:
     def on_join(self):
         """目印になるものを置く: 色の違う 4 本の柱と、名札の付いた防具立て (ビルボードの確認用)。"""
         time.sleep(2)
-        self.command("time set noon")
+        if self.time_of_day != "noon":
+            # 太陽の位置を決めて確認するとき (光の筋の確認など) は、時間を止める
+            # (26.1 以降は規則の名前が変わったので、両方送る。合わない方は失敗するだけ)
+            self.command("gamerule doDaylightCycle false")
+            self.command("gamerule advance_time false")
+        self.command(f"time set {self.time_of_day}")
         self.command("weather clear")
         for dx, dz, block in ((6, 0, "red_wool"), (-6, 0, "blue_wool"), (0, 6, "lime_wool"), (0, -6, "yellow_wool")):
             self.command(f"execute at {PLAYER} run fill ~{dx} ~ ~{dz} ~{dx} ~4 ~{dz} minecraft:{block}")
@@ -212,8 +218,32 @@ def prepare_work_dir(work_dir, mod, config, extra_options=()):
         (work_dir / "config" / "panorama_window.json").write_text(json.dumps(config, indent=2))
 
 
-def minecraft_window_box():
-    """Minecraft のウィンドウの位置 (左, 上, 右, 下)。見つからなければ None。"""
+def client_pids(work_dir):
+    """この作業フォルダで動いている Minecraft (java) のプロセス ID。
+    MarumaSign などの確認が同時に動いていても、そちらのウィンドウを撮ったり閉じたりしないように使う。"""
+    script = ("Get-CimInstance Win32_Process -Filter \"Name like 'java%'\" | "
+              # 動作確認の出力先 (<作業フォルダ>\selftest) で探す。作業フォルダの名前だけだと、前方が同じ別の確認にも当たる
+              "Where-Object { $_.CommandLine -like ('*' + $env:PANORAMA_WORK_DIR + '\\selftest*') } | "
+              "ForEach-Object { $_.ProcessId }")
+    try:
+        output = subprocess.run(["powershell", "-NoProfile", "-Command", script], capture_output=True, text=True,
+                                timeout=60, env=dict(os.environ, PANORAMA_WORK_DIR=str(work_dir))).stdout
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return {int(line) for line in output.split() if line.isdigit()}
+
+
+def _window_pid(window):
+    import ctypes
+    from ctypes import wintypes
+
+    pid = wintypes.DWORD()
+    ctypes.windll.user32.GetWindowThreadProcessId(window, ctypes.byref(pid))
+    return pid.value
+
+
+def minecraft_window_box(pids):
+    """Minecraft のウィンドウの位置 (左, 上, 右, 下)。pids のプロセスのものだけを探す。見つからなければ None。"""
     import ctypes
     from ctypes import wintypes
 
@@ -222,7 +252,7 @@ def minecraft_window_box():
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def visit(window, _):
-        if user32.IsWindowVisible(window):
+        if user32.IsWindowVisible(window) and _window_pid(window) in pids:
             title = ctypes.create_unicode_buffer(256)
             user32.GetWindowTextW(window, title, 256)
             if title.value.startswith("Minecraft"):
@@ -242,12 +272,12 @@ def minecraft_window_box():
     return box
 
 
-def grab_minecraft(path):
+def grab_minecraft(path, work_dir):
     try:
         from PIL import ImageGrab
     except ImportError:
         return False
-    box = minecraft_window_box()
+    box = minecraft_window_box(client_pids(work_dir))
     if box is None:
         return False
     try:
@@ -272,17 +302,18 @@ def settings_visible(path):
         return blue > 150 and face > 3000, f"title={blue} face={face}"
 
 
-def close_minecraft_window():
+def close_minecraft_window(work_dir):
     import ctypes
     from ctypes import wintypes
 
     user32 = ctypes.windll.user32
+    pids = client_pids(work_dir)
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def visit(window, _):
         title = ctypes.create_unicode_buffer(256)
         user32.GetWindowTextW(window, title, 256)
-        if title.value.startswith("Minecraft"):
+        if title.value.startswith("Minecraft") and _window_pid(window) in pids:
             user32.PostMessageW(window, 0x0010, 0, 0)  # WM_CLOSE
         return True
 
@@ -350,6 +381,62 @@ def faces_check(result_dir):
     return ok, " ".join(details)
 
 
+# 面と面の境目。(面, 辺, 向きを逆にするか) の組。辺は top / bottom / left / right、並びは左から右・上から下。
+# 面の並び (Panorama.FACE_ROTATIONS): 0 北, 1 東, 2 南, 3 西, 4 上 (北を向いて見上げた向き), 5 下
+SEAMS = {
+    "N|E": ((0, "right", False), (1, "left", False)),
+    "E|S": ((1, "right", False), (2, "left", False)),
+    "S|W": ((2, "right", False), (3, "left", False)),
+    "W|N": ((3, "right", False), (0, "left", False)),
+    "up|N": ((4, "bottom", False), (0, "top", False)),
+    "up|E": ((4, "right", True), (1, "top", False)),
+    "up|S": ((4, "top", True), (2, "top", False)),
+    "up|W": ((4, "left", False), (3, "top", False)),
+}
+
+
+def _edge(image, side, depth):
+    """面の辺から depth 画素目の列 (または行) の画素。"""
+    w, h = image.size
+    if side == "left":
+        return [image.getpixel((depth, y)) for y in range(h)]
+    if side == "right":
+        return [image.getpixel((w - 1 - depth, y)) for y in range(h)]
+    if side == "top":
+        return [image.getpixel((x, depth)) for x in range(w)]
+    return [image.getpixel((x, h - 1 - depth)) for x in range(w)]
+
+
+def _mean_difference(a, b):
+    return sum(abs(p - q) for x, y in zip(a, b) for p, q in zip(x, y)) / (3.0 * len(a))
+
+
+def seam_check(result_dir):
+    """面の境目で絵がつながっているか。境目をはさむ 2 列の差を、それぞれの面の内側の隣り合う列の差と比べる
+    (1 に近いほど自然につながっている。画面上の光の筋などが境目で切れると大きくなる)。
+    {境目: (境目の差, 比)}。面を書き出していなければ None。"""
+    from PIL import Image
+
+    faces = [result_dir / f"face-{i}.png" for i in range(6)]
+    if not all(face.is_file() for face in faces):
+        return None
+    images = []
+    for face in faces:
+        with Image.open(face) as image:
+            # 小さくして、テクスチャの細かい模様より大きな明るさの変化を見る
+            images.append(image.convert("RGB").resize((128, 128), Image.BILINEAR))
+    result = {}
+    for name, ((a, side_a, flip_a), (b, side_b, flip_b)) in SEAMS.items():
+        strips = []
+        for index, side, flip in ((a, side_a, flip_a), (b, side_b, flip_b)):
+            pair = [_edge(images[index], side, depth) for depth in (0, 1)]
+            strips.append([list(reversed(strip)) if flip else strip for strip in pair])
+        across = _mean_difference(strips[0][0], strips[1][0])
+        inside = (_mean_difference(strips[0][0], strips[0][1]) + _mean_difference(strips[1][0], strips[1][1])) / 2
+        result[name] = (round(across, 2), round(across / max(inside, 0.5), 2))
+    return result
+
+
 LEVEL_PATTERN = re.compile(r"(\[|/)(WARN|ERROR|FATAL)(\]|:)")
 
 
@@ -373,10 +460,11 @@ def scan_log(path):
 def run(args):
     root = Path(args.root)
     main_dir = root / "main"
-    shaders = bool(args.shaders)
+    shader_mod = args.shader_mod or None
+    shaders = bool(args.shaders or shader_mod)
     variant = f"panorama-{args.minecraft}" + ("-shaders" if shaders else "") + (f"-{args.name}" if args.name else "")
-    if shaders and shadermods.variant(args.shader_pack, None):
-        variant += "-" + shadermods.variant(args.shader_pack, None)
+    if shaders and shadermods.variant(args.shader_pack, shader_mod):
+        variant += "-" + shadermods.variant(args.shader_pack, shader_mod)
     work_dir = root / "runs" / variant
     result_dir = work_dir / "selftest"
     mod = Path(args.mod).resolve()
@@ -395,14 +483,15 @@ def run(args):
     result = {"minecraft": args.minecraft, "mod": mod.name, "ok": False, "detail": "", "work_dir": str(work_dir)}
 
     if shaders:
-        setup = shadermods.resolve("fabric", args.minecraft, root / "shadermods", args.shader_pack)
+        setup = shadermods.resolve("fabric", args.minecraft, root / "shadermods", args.shader_pack, shader_mod)
         if setup is None:
             result["detail"] = "No shader mod is available for this version"
             return result
         shadermods.install(setup, root / "shadermods", work_dir)
         result["shader_mod"] = setup["name"]
-        result["shader_pack"] = args.shader_pack
-        log(f"shader mod: {setup['name']} {[item for item, _ in setup['mods']]} + {setup['pack'][0]}")
+        result["shader_files"] = [item for item, _ in setup["mods"]]
+        result["shader_pack"] = setup["pack"][0] if setup["pack"] else setup.get("pipeline") or "canvas_basic"
+        log(f"shader mod: {setup['name']} {result['shader_files']} + {result['shader_pack']}")
     for extra in args.extra_mod or []:
         shutil.copy2(extra, work_dir / "mods" / Path(extra).name)
 
@@ -425,7 +514,7 @@ def run(args):
         result["detail"] = "Launcher install failed: " + failure
         return result
 
-    server = Server(args.minecraft, root, main_dir, args.port)
+    server = Server(args.minecraft, root, main_dir, args.port, args.time)
     client = None
     try:
         server.prepare()
@@ -446,7 +535,7 @@ def run(args):
                 settings_shot = True
                 time.sleep(1.0)
                 shot = work_dir / "screenshot-settings.png"
-                if grab_minecraft(shot):
+                if grab_minecraft(shot, work_dir):
                     result["settings_screenshot"] = str(shot)
                     result["settings_visible"], result["settings_detail"] = settings_visible(shot)
             if client.poll() is not None:
@@ -466,7 +555,7 @@ def run(args):
         else:
             result["detail"] = "Timed out"
         if client.poll() is None and sys.platform == "win32":
-            close_minecraft_window()
+            close_minecraft_window(work_dir)
             try:
                 client.wait(45)
             except subprocess.TimeoutExpired:
@@ -504,6 +593,7 @@ def run(args):
         result["images"] = [str(shot) + (" (missing)" if not shot.is_file() else "") for shot in shots]
 
     result["faces_ok"], result["faces_detail"] = faces_check(result_dir)
+    result["seams"] = seam_check(result_dir)
 
     client_log_file = work_dir / "logs" / "latest.log"
     if shaders:
@@ -530,6 +620,9 @@ def main():
     parser.add_argument("--option", action="append",
                         help='options.txt に足す行 (例: preferredGraphicsBackend:"vulkan" で 26.2 以降を Vulkan で動かす)')
     parser.add_argument("--shaders", action="store_true", help="Iris とシェーダーパックを入れて確認する")
+    parser.add_argument("--shader-mod", default="", choices=["", "iris", "optifine", "canvas"],
+                        help="影 Mod を選ぶ (optifine = OptiFabric + OptiFine、canvas = Canvas)。指定すると --shaders も付く")
+    parser.add_argument("--time", default="noon", help="ワールドの時刻 (time set に渡す値)。noon 以外なら時間を止める")
     parser.add_argument("--vulkan", action="store_true", help="Minecraft 26.2 以降を Vulkan で動かす")
     parser.add_argument("--shader-pack", default=shadermods.SHADER_PACK)
     parser.add_argument("--name", default="", help="結果のフォルダ名に付ける文字列")

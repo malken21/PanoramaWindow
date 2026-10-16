@@ -22,6 +22,7 @@ Adapter layers:
 | `fov_*` | FOV override mixin (`getFov` returning `double` / `float`, or `Camera.calculateFov`). |
 | `acc_1_14` | Accessors for fields that have no setters before 1.17. |
 | `bb_*`, `camera_*`, `nametag_*` | Billboard / name-tag mixins (see [How it works](how-it-works.md#billboards)). |
+| `hand_items` | 1.16 - 1.20.4 (the versions OptiFabric exists for): skip `ItemInHandRenderer.renderHandsWithItems` while capturing, because OptiFine's shader pipeline draws the hand without checking `GameRenderer.renderHand`. |
 | `sdl_events` | 26.3+: keep SDL window events of the panorama window away from Minecraft. |
 | `ui_*` | Settings screen: texture upload + screen drawing per era. Generated from MarumaSign by `python tools/gen_ui_adapters.py` (the output is committed). |
 
@@ -58,7 +59,22 @@ python tools/verify/matrix.py 1.20.1 26.3        # chosen versions
 python tools/verify/matrix.py --shaders          # with Iris + a shader pack (BSL by default)
 python tools/verify/matrix.py --shaders --shader-pack complementary-reimagined 1.21.1
 python tools/verify/matrix.py --option 'preferredGraphicsBackend:"vulkan"' 26.2   # Vulkan backend
+
+# Other shader mods (results: --summary build/verify-optifabric.json / verify-canvas.json)
+python tools/verify/matrix.py --shader-mod optifine --loader-version 0.15.11 1.16.5 1.20.1   # OptiFabric + OptiFine
+python tools/verify/matrix.py --shader-mod canvas 1.18.2 1.20.1                              # Canvas (canvas_basic)
+python tools/verify/matrix.py --shader-mod canvas --shader-pack canvas_standard 1.20.1       # another Canvas pipeline
+
+# God rays across seams: frozen clock (sun ~42° up in the east), Overscan 1.0 vs 1.5
+python tools/verify/matrix.py --shaders --shader-pack sildurs-vibrant-shaders --time 2000 \
+    --config '{"Overscan": 1.0}' --name godrays-1.0 --summary build/verify-godrays-iris-1.0.json 1.20.1
 ```
+
+OptiFabric is downloaded from CurseForge, OptiFine from the BMCLAPI mirror, everything else from
+Modrinth. OptiFabric 1.14.3 deadlocked while remapping OptiFine on Fabric Loader 0.20.0 (its worker threads
+wait for Knot's class-loading lock), so its runs pin Loader 0.15.11 (the oldest this mod accepts is
+0.15.0). Use `--port` to run next to MarumaSign's checks;
+the script only captures and closes the Minecraft window of its own client.
 
 ### The real-client self test
 
@@ -77,6 +93,12 @@ A run is **OK** when all of these hold:
 Results go to `build/verify-summary.json` (or the file given with `--summary`). Runs share the
 client / server cache with MarumaSign's checks (`~/.marumasign-verify`).
 
+Each run also writes `faces-sheet.png` (the six faces side by side) and measures every face seam:
+the colour step across the seam divided by the step between neighbouring pixels inside the faces
+(about 1 = continuous; the test armour stand sits on the east/south seam, so that one is always
+higher). The seam values are informational and do not affect **OK**.
+
 `python tools/verify/report.py` turns `build/verify-summary.json`, `verify-shaders.json`,
-`verify-complementary.json` and `verify-vulkan.json` into [verification.md](verification.md). That
-file is generated - edit `report.py`, not the Markdown.
+`verify-complementary.json`, `verify-optifabric.json`, `verify-canvas.json`, `verify-vulkan.json` and
+the `verify-godrays-*.json` files into [verification.md](verification.md). That file is generated -
+edit `report.py`, not the Markdown.

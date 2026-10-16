@@ -3,6 +3,8 @@
     python tools/verify/matrix.py                       # 既定の代表的なバージョン
     python tools/verify/matrix.py 1.16.5 1.21.11 26.2   # バージョンを指定
     python tools/verify/matrix.py --shaders             # Iris とシェーダーパックを入れて確認
+    python tools/verify/matrix.py --shader-mod optifine 1.16.5 1.20.1   # OptiFabric + OptiFine
+    python tools/verify/matrix.py --shader-mod canvas 1.18.2 1.20.1     # Canvas
 """
 
 import argparse
@@ -26,6 +28,11 @@ def main():
     parser.add_argument("--mod", default=None)
     parser.add_argument("--shaders", action="store_true")
     parser.add_argument("--shader-pack", default=None)
+    parser.add_argument("--shader-mod", default="", help="iris / optifine (OptiFabric) / canvas")
+    parser.add_argument("--time", default="", help="ワールドの時刻 (光の筋の確認など)")
+    parser.add_argument("--loader-version", default="",
+                        help="Fabric Loader の版 (OptiFabric 1.14.3 は Loader 0.20.0 だと起動の途中で止まるので 0.15.11 を使う)")
+    parser.add_argument("--port", default="", help="サーバーのポート (ほかの確認と同時に動かすとき)")
     parser.add_argument("--config", default="")
     parser.add_argument("--name", default="")
     parser.add_argument("--option", action="append", help="options.txt に足す行")
@@ -41,6 +48,14 @@ def main():
             command.append("--shaders")
         if args.shader_pack:
             command += ["--shader-pack", args.shader_pack]
+        if args.shader_mod:
+            command += ["--shader-mod", args.shader_mod]
+        if args.time:
+            command += ["--time", args.time]
+        if args.loader_version:
+            command += ["--loader-version", args.loader_version]
+        if args.port:
+            command += ["--port", args.port]
         if args.config:
             command += ["--config", args.config]
         if args.name:
@@ -61,6 +76,9 @@ def main():
         print(f"{version}: {state} {result.get('detail', '')} images_ok={result.get('images_ok')} "
               f"findings={len(result.get('findings', []))} settings={result.get('settings_visible')} faces={result.get('faces_ok')} spout={result.get('spout_ok')} "
               f"shaders_active={result.get('shaders_active')}", flush=True)
+        if result.get("seams"):
+            print("    seams (difference, ratio): " + " ".join(f"{name}={value[0]}/{value[1]}"
+                                                         for name, value in result["seams"].items()), flush=True)
         for line in result.get("findings", [])[:8]:
             print("    " + line, flush=True)
         Path(args.summary).parent.mkdir(parents=True, exist_ok=True)
