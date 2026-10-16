@@ -1,14 +1,15 @@
 # Development
 
-The build layout follows [MarumaSign](https://github.com/TORO-Server/MarumaSign): every supported
-Minecraft version range is a separate build target, and all of them are packed into one jar.
+Every supported Minecraft version range is a separate build target, and all of them are packed into
+one jar. [`targets.json`](../targets.json) is the list of targets: which Minecraft versions each one
+covers, and which adapter layers each era stacks.
 
 ## Layout
 
 | Folder | Contents |
 | --- | --- |
 | `core` | Everything that does not touch Minecraft: capture scheduling, the panorama window (GLFW / SDL3), the GL face copy, the settings UI toolkit (ported from MarumaSign), Spout2, config, translations. Compiled for Java 8 against the oldest bundled libraries (LWJGL 3.2.1, Gson 2.8.0). Two extra source sets hold code that needs newer LWJGL APIs and is only loaded when they exist: `ffi33` (libffi, LWJGL 3.3+) and `sdl` (SDL3, Minecraft 26.3+). |
-| `adapters` | Minecraft-version-specific code, in small layers. `targets.json` lists, per era, which layers are stacked. All layers use the package `marumasa.panorama_window.adapter`. |
+| `adapters` | Minecraft-version-specific code, in small layers (stacked per era as `targets.json` says). All layers use the package `marumasa.panorama_window.adapter`. |
 | `dist` | Builds `PanoramaWindow-<version>.jar`: `core` plus one nested jar per target (Fabric's jar-in-jar picks the one whose `minecraft` dependency matches). |
 | `tools` | Linkage check, real-client verification, UI layer generator. |
 
@@ -59,10 +60,23 @@ python tools/verify/matrix.py --shaders --shader-pack complementary-reimagined 1
 python tools/verify/matrix.py --option 'preferredGraphicsBackend:"vulkan"' 26.2   # Vulkan backend
 ```
 
+### The real-client self test
+
 The self test (`-Dpanorama_window.selftest=<dir>`) waits for several full sweeps, saves the panorama
 window, turns 90° and looks up (saving each time), opens the settings screen (the script captures the
-Minecraft window), turns Spout2 on and checks that the sender is registered, then quits. The script
-checks that the images contain a scene and change with the view, that the settings screen is
-visible, and that the log has no mod-related warnings or mixin failures. Results go to
-`build/verify-summary.json`; runs share the client / server cache with MarumaSign's checks
-(`~/.marumasign-verify`).
+Minecraft window), turns Spout2 on and checks that the sender is registered, then quits.
+
+A run is **OK** when all of these hold:
+
+- the panorama images contain a scene and change with the view;
+- the four horizontal faces show the ground (no missing terrain; checked on OpenGL only);
+- the settings screen was visible;
+- the Spout2 sender was registered (Windows only);
+- the log has no mod-related warnings, OpenGL errors or mixin failures.
+
+Results go to `build/verify-summary.json` (or the file given with `--summary`). Runs share the
+client / server cache with MarumaSign's checks (`~/.marumasign-verify`).
+
+`python tools/verify/report.py` turns `build/verify-summary.json`, `verify-shaders.json`,
+`verify-complementary.json` and `verify-vulkan.json` into [verification.md](verification.md). That
+file is generated - edit `report.py`, not the Markdown.

@@ -5,19 +5,15 @@ window - and, on Windows, can send it to other apps through **Spout2**.
 
 ![mc-360](.github/assets/mc-360.gif)
 
-- **One jar for every Fabric version from Minecraft 1.14 to 26.3.** Fabric Loader picks the
-  implementation that matches the running game. Fabric API is *not* required.
-- **Works with shader mods** (Iris / Oculus-style packs, OptiFine through OptiFabric, Canvas): the
-  panorama shows the shaded world, and options exist to keep screen-space effects such as god rays
-  continuous across the cube-face seams.
+- **One jar for every supported Minecraft version** (see [Requirements](#requirements)). Fabric
+  Loader picks the implementation that matches the running game.
+- **Shader mods**: the panorama shows the shaded world (see [Compatibility](#compatibility)).
 - **In-game settings screen** (press **O**, rebindable under *Controls → Miscellaneous*). Changes
   apply immediately.
 - **Spout2 output** (Windows): the equirectangular panorama is shared GPU-to-GPU with OBS, Resolume,
-  TouchDesigner, etc. Implemented in pure Java on top of the LWJGL that Minecraft already ships -
-  no native DLL is bundled.
+  TouchDesigner, etc. No native DLL is bundled.
 
-Turning your view never re-renders the world: the six cube faces are locked to the world axes and
-the window's fragment shader just rotates the sampled direction. See
+How the capture, the shader-mod handling and Spout2 work is described in
 [How it works](docs/how-it-works.md).
 
 ## Requirements
@@ -29,30 +25,47 @@ the window's fragment shader just rotates the sampled direction. See
 | Fabric API | not needed |
 | Java | whatever your Minecraft version uses |
 
+## Compatibility
+
+| | Status |
+| --- | --- |
+| Vanilla (OpenGL, and the Vulkan backend of 26.2+) | Tested on real clients - which versions: [Verification results](docs/verification.md). |
+| Iris + shader packs | Tested on real clients - which versions and packs: [Verification results](docs/verification.md). |
+| OptiFine (through OptiFabric) | Detected, but **not tested on a real client**. |
+| Canvas | Detected, but **not tested on a real client**. |
+
+"Detected" means the mod recognises the shader mod and switches to its shader-pack behaviour
+([details](docs/how-it-works.md#shader-mods)).
+
+### Known limitations
+
+- **Particles in 1.14 - 1.21.8** are not turned to a common direction while capturing, so a particle
+  on a cube-face boundary can tear along the seam ([why](docs/how-it-works.md#billboards)).
+
 ## Settings
 
-Open the settings screen with **O** (or edit `config/panorama_window.json`; the file is rewritten on
-every change and unknown / missing keys are tolerated).
+Open the settings screen with **O**, or edit `config/panorama_window.json`. The file is rewritten on
+every change; unknown keys are ignored and missing keys keep their defaults.
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `Width` / `Height` | `1280` / `720` | Panorama window size. The window is resizable; its last size is written back here on quit. |
-| `ShowWindow` | `true` | Show the panorama window. Turn it off if you only want the Spout2 output. |
-| `Borderless` | `false` | Hide the window's title bar / border (drag anywhere to move it). |
-| `PauseWhenHidden` | `true` | Stop capturing while the window is minimized (capturing continues while Spout2 is on). |
-| `CaptureMode` | `auto` | `crop`: keep the game's render target and cut the central square out of a 90° (or wider) render - shader friendly. `resize`: re-create the render target at the face size - can exceed the game window's resolution. `auto`: `crop` with shader packs / Fabulous!, otherwise whichever gives enough resolution. |
-| `CaptureInterval` | `2` | Client ticks between capture batches (at least 6 while a shader pack is active). |
-| `FacesPerCapture` | `2` | Faces re-rendered per batch (`1`-`6`). Always 1 while a shader pack is active (see How it works). |
-| `Overscan` | `0` | Render wider than the 90° face and keep only the centre (e.g. `1.5` ≈ 113° FOV). Screen-space effects such as god rays then have context past the face edge and no longer break at the seams. `0` = automatic (`1.5` while a shader pack is active, else `1.0`). |
-| `SpoutEnabled` | `false` | Send the panorama via Spout2 (Windows). |
-| `SpoutName` | `PanoramaWindow` | Spout2 sender name (a `_1`, `_2`, ... suffix is added if it is taken). |
-| `SpoutWidth` | `3840` | Width of the Spout2 image; the height is half (2:1 equirectangular). |
+| Key | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `Width` / `Height` | `1280` / `720` | 64 - 15360 | Panorama window size. The window is resizable; its last size is written back here on quit. |
+| `ShowWindow` | `true` | | Show the panorama window. Turn it off if you only want the Spout2 output. |
+| `Borderless` | `false` | | Hide the window's title bar / border (drag anywhere to move it). |
+| `PauseWhenHidden` | `true` | | Stop capturing while the window is minimized (capturing continues while Spout2 is on). |
+| `CaptureMode` | `auto` | `auto` / `crop` / `resize` | How a face is captured; see [Two capture modes](docs/how-it-works.md#two-capture-modes). |
+| `CaptureInterval` | `2` | 1 or more (settings screen: up to 40) | Client ticks between capture batches. Raised while a shader pack is active ([Shader mods](docs/how-it-works.md#shader-mods)). |
+| `FacesPerCapture` | `2` | 1 - 6 | Faces re-rendered per batch. Forced to 1 while a shader pack is active ([Shader mods](docs/how-it-works.md#shader-mods)). |
+| `Overscan` | `0` | `0`, or 1.0 - 3.0 | Render wider than the 90° face and keep only the centre (e.g. `1.5` ≈ 113° FOV), so screen-space effects such as god rays continue across seams. `0` = automatic ([Shader mods](docs/how-it-works.md#shader-mods)). |
+| `SpoutEnabled` | `false` | | Send the panorama via Spout2 (Windows). |
+| `SpoutName` | `PanoramaWindow` | | Spout2 sender name (a `_1`, `_2`, ... suffix is added if it is taken). |
+| `SpoutWidth` | `3840` | 256 - 8192 | Width of the Spout2 image (rounded down to a multiple of 4); the height is half (2:1 equirectangular). |
 
 ## Documentation
 
 - [How it works](docs/how-it-works.md) - capture pipeline, shader-mod handling, billboards, Spout2, Vulkan / SDL3.
 - [Development](docs/development.md) - repository layout, building, and the automated real-client checks.
-- [Verification results](docs/verification.md) - which versions and shader setups have been tested.
+- [Verification results](docs/verification.md) - the latest results of those checks.
 
 ## License
 

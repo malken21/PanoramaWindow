@@ -23,6 +23,8 @@ otherwise make the GPU pick the smallest mip and draw a line along every seam.
 
 ## Two capture modes
 
+The `CaptureMode` setting chooses how a face is captured:
+
 | | `crop` | `resize` |
 | --- | --- | --- |
 | Render target | the game's own, unchanged | re-created as a square of the face size |
@@ -36,30 +38,39 @@ more pixels than the game window has.
 
 ## Shader mods
 
-Shader packs (Iris, OptiFine, Canvas, ...) render through the normal level-render call, so the faces
-are shaded like the game. Three things are handled specially:
+Shader mods hook the normal level-render call, so the faces are shaded like the game. While a shader
+pack is active, three things are handled specially:
 
 - **Render targets** - packs allocate many screen-sized buffers. Changing the game's render-target
   size (as `resize` does) makes them reallocate everything twice per capture, so `crop` is used.
 - **State carried between renders** - shader pipelines keep state from the previous render (the
   previous camera for TAA / motion blur, history buffers, ...). Rendering two faces back to back
   makes the second one inherit the first one's state; with old Iris (1.16.5) whole parts of the
-  terrain then vanish. So while a shader pack is active, **one face is rendered per batch and the
+  terrain then vanish. So **one face is rendered per batch (`FacesPerCapture` is ignored) and the
   normal view is rendered once right after it** (off-screen; the next game frame overwrites it).
   That also keeps the game's own TAA history clean. Packs also need a few real frames between
   captures to settle (and a few seconds after joining a world) - capturing too densely or too early
-  turns whole faces white with fog on some Iris versions - so with a shader pack active the batch
-  interval is at least 6 ticks and capturing starts 5 seconds after joining or changing dimension.
-  A full sweep then takes about two seconds; turning the view is still instant.
+  turns whole faces white with fog on some Iris versions - so the batch interval is at least 6 ticks
+  (`CaptureInterval` is raised to that) and capturing starts 5 seconds after joining or changing
+  dimension. A full sweep then takes about two seconds; turning the view is still instant.
 - **God rays and other screen-space effects** - many packs compute light shafts from the sun's
   position on screen and only from what is on screen. At a face edge the computation simply runs
   out of image, so the rays stop at the seam. With `Overscan` the face is rendered wider than 90°
-  (default 1.5×, ≈ 113°) and only the centre is kept, so every face has context beyond its edge
-  and the rays line up across seams. A pack that disables its rays entirely when the sun is behind
-  the camera will still show no rays on that face - that is the pack's choice.
+  and only the centre is kept, so every face has context beyond its edge and the rays line up
+  across seams. `Overscan = 0` (automatic) means 1.5× (≈ 113°) while a shader pack is active and
+  1.0× otherwise. A pack that disables its rays entirely when the sun is behind the camera will
+  still show no rays on that face - that is the pack's choice.
 
-Shader-pack detection is reflective and needs no dependency: Iris's public API
-(`IrisApi.isShaderPackInUse`), OptiFine's `Config.isShaders`, and the presence of Canvas.
+Shader-pack detection is reflective and needs no dependency (`ShaderMods`):
+
+| Shader mod | "A shader pack is active" when |
+| --- | --- |
+| Iris (or anything exposing Iris's API) | `IrisApi.getInstance().isShaderPackInUse()` returns true |
+| OptiFine (through OptiFabric) | `net.optifine.Config.isShaders()` returns true |
+| Canvas | `grondag.canvas.CanvasMod` is present (always) |
+
+Which of these have actually been tried on a real client is listed under
+[Compatibility](../README.md#compatibility).
 
 ## GPU-to-GPU copy
 
@@ -107,7 +118,10 @@ How the billboard direction reaches the renderer changed many times, so each era
 | 1.21.9 - 1.21.11 | `CameraRenderState.orientation`, set in `GameRenderer.extractCamera` | swap `orientation` during `SubmitNodeCollection.submitNameTag` |
 | 26.1+ | `CameraRenderState.orientation`, set in `Camera.extractRenderState` | same |
 
-Particles in 1.14 - 1.21.8 read the camera's own rotation and are not adjusted.
+Particles are billboards too, but in older versions they read the `Camera`'s own rotation instead of
+the billboard direction above. This mod does not override that rotation, so those particles are left
+as vanilla draws them. The affected versions are listed under
+[Known limitations](../README.md#known-limitations).
 
 ## Spout2
 
