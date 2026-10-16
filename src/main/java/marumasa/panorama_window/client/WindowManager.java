@@ -1,25 +1,59 @@
 package marumasa.panorama_window.client;
 
-import net.minecraft.client.MinecraftClient;
+import com.mojang.blaze3d.platform.NativeImage;
+import net.minecraft.client.Minecraft;
+import org.lwjgl.BufferUtils;
+import org.lwjgl.opengl.GL;
+import org.lwjgl.opengl.GLCapabilities;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 import static marumasa.panorama_window.PanoramaWindow.CONFIG;
+import static marumasa.panorama_window.PanoramaWindow.LOGGER;
 import static org.lwjgl.glfw.GLFW.*;
-import static org.lwjgl.glfw.GLFWErrorCallback.createPrint;
 import static org.lwjgl.opengl.GL31.*;
 
 public class WindowManager {
 
     public final long window;
 
-    private final int window_width;
-    private final int window_height;
-    private final int camera_size;
+    private final long mcWindow;
+    private final GLCapabilities mcCapabilities;
+    private GLCapabilities panoramaCapabilities;
+
+    // Updated from the GLFW framebuffer-size callback when the user resizes the window.
+    private volatile int window_width;
+    private volatile int window_height;
+
+    // Cube-face capture resolution that matches the current window size. Recomputed on resize;
+    // PanoramaManager polls faceSize() and reallocates its buffers to match at a sweep boundary,
+    // then the resized pixels flow in and uploadFaces() grows/shrinks each GL texture to fit.
+    private volatile int faceSize;
+    // Last GL texture id seen in each of the six slots; when it changes we (re)apply sampler state.
+    private final int[] boundFaceIds = new int[6];
+    // Upper bound for faceSize: what the GPU can allocate, hard-capped for VRAM sanity. Large
+    // enough that an 8K window (~2160 px/face wanted) captures at full resolution.
+    private final int maxFaceSize;
 
     private WindowPos windowPos;
     private CursorPos cursorPos;
     private boolean isDragging = false;
+    // Avoids re-clearing + swapping the window every tick while it is already black.
+    private boolean isBlack = false;
+
+    // The last yaw / pitch the window was drawn with; lets renderShader skip a full context switch +
+    // redraw when nothing has changed (view held still, no new face data, no screenshot pending).
+    private float lastYaw = Float.NaN;
+    private float lastPitch = Float.NaN;
+
+    // Set by requestCapture(...); the next shader render writes the panorama window to this file.
+    private volatile Path pendingCapture;
+    // Reused scratch buffer for the (test-only) screenshot read-back; grown on demand.
+    private ByteBuffer screenshotPixels;
 
     private static final class WindowPos {
         public final int x;
@@ -48,32 +82,62 @@ public class WindowManager {
         }
     }
 
-    public WindowManager(int width, int height, String title, int camera_size, MinecraftClient client) {
+    /** Cube-face capture resolution that keeps up with a panorama window this big (px). */
+    static int faceSizeFor(int windowWidth, int windowHeight, int maxFaceSize) {
+        // The window shows the full 360x180 equirectangular field: 360 deg across the width, 180 deg
+        // down the height. A cube face spans 90 deg, so to roughly match the window's angular pixel
+        // density a face needs about width/4 (and height/2) pixels; * 1.5 for headroom, since the
+        // gnomonic face projection undersamples toward its edges. At 8K (7680x4320) that asks for
+        // ~3240 px/face; the cap is the GPU's max texture size (clamped to 8192).
+        int ideal = (int) Math.ceil(1.5 * Math.max(windowWidth / 4.0, windowHeight / 2.0));
+        int step = 128; // quantise so a slow resize drag doesn't reallocate textures every pixel
+        int rounded = ((ideal + step - 1) / step) * step;
+        return Math.min(maxFaceSize, Math.max(256, rounded));
+    }
+
+    public WindowManager(int width, int height, String title, Minecraft client) {
         window_width = width;
         window_height = height;
-        this.camera_size = camera_size;
-        // GLFWのエラコールバックを設定
-        createPrint(System.err).set();
-        // GLFWを初期化
+
+        // Remember Minecraft's context so we can hand it back after every operation.
+        this.mcWindow = client.getWindow().handle();
+        this.mcCapabilities = GL.getCapabilities();
+
+        // GLFW is already initialized by Minecraft; this is just defensive.
         if (!glfwInit()) {
             throw new IllegalStateException("Unable to initialize GLFW");
         }
-        // ウィンドウを作成時にウィンドウを表示する
-        glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
-        // ウィンドウのサイズを変更不可にする
-        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-        // ボーダーレスにするかどうかを設定する
-        glfwWindowHint(GLFW_DECORATED, CONFIG.isBorderless() ? GLFW_FALSE : GLFW_TRUE);
-        // 垂直同期をオフにする
-        glfwSwapInterval(0);
-        // ウィンドウを作成
-        window = glfwCreateWindow(window_width, window_height, title, 0, 0);
-        // OpenGLコンテキストの初期化
-        glfwMakeContextCurrent(window);
-        // ウィンドウ全体を黒色を描画する
-        runBlack();
 
-        // マウスボタンコールバックの設定
+        glfwDefaultWindowHints();
+        // Show the window as soon as it is created.
+        glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
+        // Let the user resize the panorama window (the shader pass just re-fits to the framebuffer).
+        glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+        // Borderless or not, depending on the config.
+        glfwWindowHint(GLFW_DECORATED, CONFIG.isBorderless() ? GLFW_FALSE : GLFW_TRUE);
+
+        // Create the window sharing Minecraft's GL context, so the panorama shader can sample the
+        // cube-face textures the game renderer fills GPU-side - no CPU read-back, no re-upload.
+        window = glfwCreateWindow(window_width, window_height, title, 0, mcWindow);
+        if (window == 0) {
+            glfwDefaultWindowHints();
+            throw new IllegalStateException("Failed to create the panorama window");
+        }
+
+        // Switch to the panorama context and build its GL capabilities.
+        glfwMakeContextCurrent(window);
+        this.panoramaCapabilities = GL.createCapabilities();
+        // How large a cube face this GPU will let us allocate (clamped so an absurd window size
+        // can't try to make a multi-gigabyte texture set). GL guarantees at least 1024.
+        int glMaxTexture = glGetInteger(GL_MAX_TEXTURE_SIZE);
+        this.maxFaceSize = Math.min(8192, glMaxTexture > 0 ? glMaxTexture : 2048);
+        // Disable v-sync for the panorama window.
+        glfwSwapInterval(0);
+        // Paint it black to start with.
+        runBlack();
+        isBlack = true;
+
+        // Drag the window around with the left mouse button.
         glfwSetMouseButtonCallback(window, (window, button, action, mods) -> {
             if (button == GLFW_MOUSE_BUTTON_LEFT) {
                 if (action == GLFW_PRESS) {
@@ -85,7 +149,6 @@ public class WindowManager {
             }
         });
 
-        // マウスカーソル位置コールバックの設定
         glfwSetCursorPosCallback(window, (window, xpos, ypos) -> {
             if (isDragging) {
                 windowPos = new WindowPos(window);
@@ -96,149 +159,240 @@ public class WindowManager {
             }
         });
 
+        // Track the framebuffer size so the shader pass fills the whole window after a resize.
+        // (Framebuffer pixels, not screen coordinates - they differ on hi-DPI displays.)
+        int[] fbWidth = new int[1];
+        int[] fbHeight = new int[1];
+        glfwGetFramebufferSize(window, fbWidth, fbHeight);
+        window_width = fbWidth[0];
+        window_height = fbHeight[0];
+        faceSize = faceSizeFor(window_width, window_height, maxFaceSize);
+        glfwSetFramebufferSizeCallback(window, (win, w, h) -> {
+            if (w > 0 && h > 0) {
+                window_width = w;
+                window_height = h;
+                faceSize = faceSizeFor(w, h, maxFaceSize);
+                // Force the next renderShader to actually redraw at the new size.
+                lastYaw = Float.NaN;
+            }
+        });
 
         shaderManager = new ShaderManager();
 
-        // VAOとVBOの作成
-        int vaoID = glGenVertexArrays();
-        glBindVertexArray(vaoID);
+        // VAO and VBO.
+        VAO = glGenVertexArrays();
+        glBindVertexArray(VAO);
 
         float[] vertices = {
-                -1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, // 左下
-                1.0f, -1.0f, 0.0f, 1.0f, 0.0f, 0.0f, // 右下
-                1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, // 右上
-                -1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f  // 左上
+                -1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 0.0f, // bottom left
+                1.0f, -1.0f, 0.0f, 1.0f, 0.0f, 0.0f, // bottom right
+                1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, // top right
+                -1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f  // top left
         };
 
         VBO = glGenBuffers();
         glBindBuffer(GL_ARRAY_BUFFER, VBO);
         glBufferData(GL_ARRAY_BUFFER, vertices, GL_STATIC_DRAW);
 
-        // 頂点属性の指定
+        // Vertex attributes.
         glVertexAttribPointer(0, 3, GL_FLOAT, false, 24, 0);
         glEnableVertexAttribArray(0);
         glVertexAttribPointer(1, 3, GL_FLOAT, false, 24, 12);
         glEnableVertexAttribArray(1);
 
 
-        for (int i = 0; i < textures.length; i++) {
-            textures[i] = glGenTextures();
-            glBindTexture(GL_TEXTURE_2D, textures[i]);
-            glTexImage2D(
-                    GL_TEXTURE_2D,
-                    0,
-                    GL_RGBA8,
-                    this.camera_size,
-                    this.camera_size,
-                    0,
-                    GL_RGBA,
-                    GL_UNSIGNED_BYTE,
-                    (ByteBuffer) null
-            );
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+        // The face textures themselves are owned by PanoramaManager (created through Blaze3D so the
+        // game renderer can blit into them) and live in the shared GL namespace; this window just
+        // binds their ids. Their sampler state is set once, the first time each id is seen.
+
+        // The sampler -> texture-unit mapping never changes, so bind it once instead of
+        // re-querying the uniform locations on every frame.
+        int program = shaderManager.getShaderProgram();
+        glUseProgram(program);
+        for (int i = 0; i < SAMPLER_NAMES.length; i++) {
+            int location = glGetUniformLocation(program, SAMPLER_NAMES[i]);
+            if (location >= 0) {
+                glUniform1i(location, i);
+            }
         }
-        // OpenGLコンテキストの初期化
-        glfwMakeContextCurrent(client.getWindow().getHandle());
+        uYawLocation = glGetUniformLocation(program, "uYaw");
+        uPitchLocation = glGetUniformLocation(program, "uPitch");
+        glUseProgram(0);
+
+        // Hand the context back to Minecraft.
+        releaseContext();
     }
 
-    int[] textures = new int[6];
-
     private final int VBO;
+    private final int VAO;
     private final ShaderManager shaderManager;
+    private final int uYawLocation;
+    private final int uPitchLocation;
 
-    public void renderShader(ByteBuffer[] buffers) {
-        // OpenGLコンテキストの初期化
+    // Sampler uniform -> texture unit. Index matches the cube face order produced by PanoramaManager:
+    // 0=front(N), 1=right(E), 2=back(S), 3=left(W), 4=top, 5=bottom.
+    private static final String[] SAMPLER_NAMES = {
+            "texFront", "texRight", "texBack", "texLeft", "texTop", "texBottom"
+    };
+
+    private void makeContext() {
         glfwMakeContextCurrent(window);
+        GL.setCapabilities(panoramaCapabilities);
+    }
 
-        glViewport(0, 0, window_width, window_height);
-        loadUniforms(buffers, camera_size, camera_size);
-        runShader();
+    private void releaseContext() {
+        glfwMakeContextCurrent(mcWindow);
+        GL.setCapabilities(mcCapabilities);
+    }
 
-        // OpenGLコンテキストの初期化 ()
-        glfwMakeContextCurrent(MinecraftClient.getInstance().getWindow().getHandle());
+    /** Requests that the next {@link #renderShader} write the panorama window to {@code path} as a PNG. */
+    public void requestCapture(Path path) {
+        this.pendingCapture = path;
+    }
+
+    /** Cube-face capture resolution the current window size wants. Polled by {@link PanoramaManager}. */
+    public int faceSize() {
+        return faceSize;
+    }
+
+    /** The panorama window's current size in screen coordinates (not framebuffer pixels). */
+    public int[] windowSize() {
+        int[] w = new int[1];
+        int[] h = new int[1];
+        glfwGetWindowSize(window, w, h);
+        return new int[]{w[0], h[0]};
+    }
+
+    /**
+     * Redraws the panorama window.
+     *
+     * @param faceGlIds    GL texture names of the six cube faces (shared context), face order
+     *                     0=front(N) 1=right(E) 2=back(S) 3=left(W) 4=top 5=bottom
+     * @param incomingFaceSize edge length (px) of the face textures (unused now the window samples
+     *                     them directly with normalised coordinates; kept for signature stability)
+     * @param yawRadians   horizontal view rotation (0 = "front"/north face centred)
+     * @param pitchRadians vertical view rotation (0 = horizon level)
+     * @param dirtyMask    bit {@code i} set => face {@code i} was re-captured since the last present
+     */
+    public void renderShader(int[] faceGlIds, int incomingFaceSize,
+                             float yawRadians, float pitchRadians, int dirtyMask) {
+        boolean changed = dirtyMask != 0
+                || pendingCapture != null
+                || isBlack
+                || Float.isNaN(lastYaw)
+                || Float.isNaN(lastPitch)
+                || Math.abs(yawRadians - lastYaw) > 1.0e-4f
+                || Math.abs(pitchRadians - lastPitch) > 1.0e-4f
+                || isDragging;
+        if (!changed) return;
+
+        makeContext();
+        try {
+            glViewport(0, 0, window_width, window_height);
+
+            glClear(GL_COLOR_BUFFER_BIT);
+
+            glUseProgram(shaderManager.getShaderProgram());
+            if (uYawLocation >= 0) {
+                glUniform1f(uYawLocation, yawRadians);
+            }
+            if (uPitchLocation >= 0) {
+                glUniform1f(uPitchLocation, pitchRadians);
+            }
+
+            bindFaces(faceGlIds);
+
+            glBindVertexArray(VAO);
+            glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+            Path capture = pendingCapture;
+            if (capture != null) {
+                pendingCapture = null;
+                writeWindowPng(capture);
+            }
+
+            glfwSwapBuffers(window);
+            isBlack = false;
+            lastYaw = yawRadians;
+            lastPitch = pitchRadians;
+        } finally {
+            releaseContext();
+        }
+    }
+
+    /** True while the panorama window is minimized (nothing on screen to update). */
+    public boolean isMinimized() {
+        return glfwGetWindowAttrib(window, GLFW_ICONIFIED) == GLFW_TRUE;
+    }
+
+    private void writeWindowPng(Path path) {
+        int w = window_width;
+        int h = window_height;
+        int needed = w * h * 4;
+        if (screenshotPixels == null || screenshotPixels.capacity() < needed) {
+            screenshotPixels = BufferUtils.createByteBuffer(needed).order(ByteOrder.LITTLE_ENDIAN);
+        }
+        ByteBuffer pixels = screenshotPixels;
+        pixels.clear();
+        glReadBuffer(GL_BACK);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+
+        try (NativeImage image = new NativeImage(w, h, false)) {
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    // glReadPixels is bottom-up; NativeImage is top-down.
+                    image.setPixelABGR(x, h - 1 - y, pixels.getInt((x + y * w) * 4) | 0xFF000000);
+                }
+            }
+            if (path.toAbsolutePath().getParent() != null) {
+                Files.createDirectories(path.toAbsolutePath().getParent());
+            }
+            image.writeToFile(path);
+            LOGGER.info("Wrote panorama window screenshot to {}", path.toAbsolutePath());
+        } catch (IOException e) {
+            LOGGER.error("Couldn't write panorama window screenshot", e);
+        }
     }
 
     public void renderBlack() {
-        // OpenGLコンテキストの初期化
-        glfwMakeContextCurrent(window);
-
-        glViewport(0, 0, window_width, window_height);
-        runBlack();
-
-        // OpenGLコンテキストの初期化 ()
-        glfwMakeContextCurrent(MinecraftClient.getInstance().getWindow().getHandle());
+        if (isBlack) return;
+        makeContext();
+        try {
+            glViewport(0, 0, window_width, window_height);
+            runBlack();
+            isBlack = true;
+            lastYaw = Float.NaN;
+            lastPitch = Float.NaN;
+        } finally {
+            releaseContext();
+        }
     }
 
     private void runBlack() {
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT); // 画面をクリア
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // 画面をクリアする色
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // clear colour
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT); // clear the screen
         glfwSwapBuffers(window);
     }
 
-    // テクスチャ読み込み
-    private int loadTexture(ByteBuffer byteBuffer, int width, int height) {
-        // テクスチャの作成
-        int textureID = glGenTextures();
-        glBindTexture(GL_TEXTURE_2D, textureID);
-        // テクスチャパラメータの設定
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        // テクスチャデータの転送
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, byteBuffer);
-        return textureID;
-    }
-
-    private void loadUniforms(ByteBuffer[] buffers, int width, int height) {
-
-        // texFront
-        glUniform1i(2, 0);
-
-        // texRight
-        glUniform1i(4, 1);
-
-        // texBack
-        glUniform1i(0, 2);
-
-        // texLeft
-        glUniform1i(3, 3);
-
-        // texTop
-        glUniform1i(5, 4);
-
-        // texBottom
-        glUniform1i(1, 5);
-
+    /**
+     * Binds the six shared face textures to units 0..5 for the shader. Their sampler state is set
+     * the first time an id appears (Blaze3D creates textures with a mipmapped min filter and no
+     * mip levels, which samples as black), and again after a resize swaps in fresh textures.
+     */
+    private void bindFaces(int[] faceGlIds) {
         for (int i = 0; i < 6; i++) {
-            switch (i) {
-                case 0 -> glActiveTexture(GL_TEXTURE0);
-                case 1 -> glActiveTexture(GL_TEXTURE1);
-                case 2 -> glActiveTexture(GL_TEXTURE2);
-                case 3 -> glActiveTexture(GL_TEXTURE3);
-                case 4 -> glActiveTexture(GL_TEXTURE4);
-                default -> glActiveTexture(GL_TEXTURE5);
+            int id = faceGlIds[i];
+            glActiveTexture(GL_TEXTURE0 + i);
+            glBindTexture(GL_TEXTURE_2D, id);
+            if (id != boundFaceIds[i]) {
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                // GL_CLAMP was removed in GL 3.1; CLAMP_TO_EDGE keeps face edges from wrapping.
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                boundFaceIds[i] = id;
             }
-            glBindTexture(GL_TEXTURE_2D, textures[i]);
-            // テクスチャデータの転送
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, buffers[i]);
         }
-    }
-
-    private void removeUniforms(int[] textures) {
-        for (int texture : textures) {
-            glDeleteTextures(texture);
-        }
-    }
-
-    private void runShader() {
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT); // 画面をクリア
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // 画面をクリアする色
-
-        glUseProgram(shaderManager.getShaderProgram());
-        glBindVertexArray(VBO);
-        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
-
-        glfwSwapBuffers(window);
     }
 }

@@ -3,14 +3,19 @@
   "id": "panorama_window",
   "version": "${version}",
   "name": "PanoramaWindow",
-  "description": "",
-  "authors": [],
+  "description": "Real-time 360 degree panorama rendered into a separate window.",
+  "authors": [
+    "malken21"
+  ],
   "contact": {
-    "repo": "https://github.com/malken21/PanoramaWindow-NoMixin"
+    "repo": "https://github.com/malken21/PanoramaWindow"
   },
   "license": "MIT",
   "icon": "assets/panorama_window/icon.png",
   "environment": "client",
+  "mixins": [
+    "panorama_window.mixins.json"
+  ],
   "entrypoints": {
     "client": [
       "marumasa.panorama_window.client.PanoramaWindowClient"
@@ -21,7 +26,8 @@
   },
   "depends": {
     "fabricloader": ">=${loader_version}",
-    "fabric": "*",
-    "minecraft": "${minecraft_version}"
+    "fabric-api": "*",
+    "minecraft": "~${minecraft_version}",
+    "java": ">=25"
   }
 }
